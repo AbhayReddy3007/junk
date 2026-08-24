@@ -106,6 +106,10 @@ You are a pharmaceutical patent attorney and strategic consultant writing a conc
 executive intelligence report for a 505(b)(2) drug development team.
 
 Below is structured patent thicket analysis data for the drug "{drug}".
+The field "narrative_patent_landscape" contains a pre-computed description of the
+total patent universe for this drug — use it as the authoritative source for the
+total number of patents analyzed and the overall patent landscape characterisation.
+
 Write a professional 2-page narrative report section for this drug. Be precise,
 analytical, and actionable. Do NOT use filler language. Keep each section concise
 to fit within 2 printed pages.
@@ -117,7 +121,7 @@ to fit within 2 printed pages.
 Return ONLY a JSON object with these exact fields (no markdown, no preamble):
 {{
   "executive_summary": "<2-3 sentences: overall IP landscape assessment and key takeaway>",
-  "patent_landscape": "<1 short paragraph: describe the patent thicket - density, diversity, technology domains covered, what this means for a generic/505b2 entrant>",
+  "patent_landscape": "<1 short paragraph: draw from narrative_patent_landscape to describe the total patents analyzed, density, diversity, technology domains covered, and what this means for a generic/505b2 entrant>",
   "thicket_score_narrative": "<2-3 sentences: interpret the final score {final_score}/5 ({score_label}) - what it means practically, key drivers including density score, diversity score, and validation %>",
   "circumvention_outlook": "<1 short paragraph: synthesise all design-around strategies across categories, highlight the most promising and most difficult categories, overall feasibility>",
   "key_risks": ["<risk 1>", "<risk 2>", "<risk 3>"],
@@ -185,6 +189,17 @@ def _float(val) -> float:
 
 def _score_label(score: int) -> str:
     return SCORE_LABELS.get(score, "N/A")
+
+
+def _extract_patent_count(narrative_text: str, fallback: int = 0) -> int:
+    """Extract the first integer that looks like a total patent count from narrative text."""
+    if not narrative_text:
+        return fallback
+    # Match patterns like "123 patents", "a total of 45 patents", "analyzed 78 patents"
+    m = re.search(r"\b(\d{1,5})\s+patents?\b", narrative_text, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    return fallback
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -331,8 +346,14 @@ def read_bq_data() -> dict:
         }
 
         if drug not in score_data:
-            score_data[drug] = {"jurisdictions": [], "avg_final_score": None}
+            score_data[drug] = {"jurisdictions": [], "avg_final_score": None,
+                                "narrative_patent_landscape": ""}
         score_data[drug]["jurisdictions"].append(jur_entry)
+        # Grab the column once — it's the same value across all jurisdiction rows
+        if not score_data[drug]["narrative_patent_landscape"]:
+            score_data[drug]["narrative_patent_landscape"] = _str(
+                row.get("narrative_patent_landscape", "")
+            )
 
     for drug, sd in score_data.items():
         jurs = sd["jurisdictions"]
@@ -448,6 +469,7 @@ def call_gemini_for_narrative(drug_data: dict, api_key: str) -> dict:
     jurs = sd.get("jurisdictions", [])
     payload = {
         "drug_name": drug_data["drug_name"],
+        "narrative_patent_landscape": sd.get("narrative_patent_landscape", ""),
         "score_summary": {
             "final_score":       final_score,
             "score_label":       score_label,
@@ -744,8 +766,12 @@ def _build_html_for_drug(entry: dict) -> str:
 
     jur_section = ""
     if jurs:
+        _npl        = sd.get("narrative_patent_landscape", "")
+        _pat_count  = _extract_patent_count(_npl, fallback=sd.get("total_combined", 0))
+        _pat_label  = f"{_pat_count} patents have been analyzed for this analysis." if _pat_count else ""
         jur_section = f"""
         <h2>Score Breakdown by Jurisdiction</h2>
+        {"<p style='font-size:0.9em;font-style:italic;color:#333;margin:4px 0 6px 0;'>" + _pat_label + "</p>" if _pat_label else ""}
         <p style="font-size:0.85em;color:#555;margin:4px 0 10px 0;">
           <b>Density</b> — number of non-blocking patents present in the thicket.&nbsp;&nbsp;
           <b>Diversity</b> — number of distinct technology categories/areas covered by non-blocking patents.
@@ -1127,6 +1153,20 @@ def build_document(drugs_list: list, output_path: str):
 
         if jurs:
             _heading(doc, "Score Breakdown by Jurisdiction")
+            # ── Patent count line from narrative_patent_landscape ─────────────
+            _npl       = sd.get("narrative_patent_landscape", "")
+            _pat_count = _extract_patent_count(_npl, fallback=sd.get("total_combined", 0))
+            if _pat_count:
+                pat_line = doc.add_paragraph()
+                pat_line.paragraph_format.space_before = Pt(2)
+                pat_line.paragraph_format.space_after  = Pt(4)
+                _r_pat = pat_line.add_run(
+                    f"{_pat_count} patents have been analyzed for this analysis."
+                )
+                _r_pat.italic = True
+                _r_pat.font.size = Pt(9)
+                _r_pat.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
+            # ── Density / Diversity definitions ───────────────────────────────
             note = doc.add_paragraph()
             note.paragraph_format.space_before = Pt(2)
             note.paragraph_format.space_after  = Pt(6)
