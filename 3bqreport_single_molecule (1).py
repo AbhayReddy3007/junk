@@ -66,7 +66,10 @@ except ImportError:
 # ── BigQuery / GCP Config ─────────────────────────────────────────────────────
 PROJECT_ID       = os.environ.get("PROJECT_ID",       "cognito-prod-394707")
 DATASET_ID       = os.environ.get("DATASET_ID",       "cognito_prod_datamart")
-CREDENTIALS_PATH = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+CREDENTIALS_PATH = (
+    os.environ.get("GCS_CREDENTIALS", "")           # preferred .env key
+    or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")  # standard ADC fallback
+)
 BQ_LOCATION      = os.environ.get("BQ_LOCATION",      "asia-south1")
 
 # Table names — must match the constants in patent_thicket_analysis.py
@@ -1224,9 +1227,8 @@ USE_DIRECT_HTML_RENDER = True
 
 def generate_report(
     api_key: str = "",
-    gcs_bucket: str = "cognito-gcs",
     drug_name: str = "",
-    local_only: bool = False,
+    local_only: bool = True,
 ):
     if not api_key:
         api_key = API_KEY
@@ -1243,8 +1245,8 @@ def generate_report(
     print(f"Project    : {PROJECT_ID}")
     print(f"Dataset    : {DATASET_ID}")
     print(f"Location   : {BQ_LOCATION}")
-    print(f"GCS bucket : gs://{gcs_bucket}/Cognito_new/reports/{{drug_name}}/Patent_Thicket_Analysis.pdf")
     print(f"PDF engine : {'xhtml2pdf (direct HTML)' if USE_DIRECT_HTML_RENDER else 'mammoth + xhtml2pdf'}")
+    print(f"Output     : local download (GCS upload disabled)")
     print(f"{'='*60}")
 
     print("\n[1/4] Reading from BigQuery...")
@@ -1299,7 +1301,7 @@ def generate_report(
         })
 
     print(f"\n[3/4] Building PDF reports...")
-    uploaded_uris = []
+    saved_paths = []
     with tempfile.TemporaryDirectory() as tmpdir:
         for entry in drugs_list:
             drug_name = entry["drug_name"]
@@ -1332,31 +1334,19 @@ def generate_report(
                     print(f"FAILED\n    ERROR: {exc}")
                     continue
 
-            if local_only:
-                # Copy the generated PDF next to the script so it survives
-                # the TemporaryDirectory cleanup.
-                local_pdf_path = os.path.abspath(
-                    f"{drug_filter.safe_name(drug_name)}_Patent_Thicket_Analysis.pdf"
-                )
-                shutil.copy2(pdf_path, local_pdf_path)
-                print(f"\n[4/4] Local-only mode")
-                print(f"    PDF saved to: {local_pdf_path}")
-            else:
-                print(f"\n[4/4] Uploading to GCS ...")
-                print(f"    Uploading to GCS ...", end=" ", flush=True)
-                try:
-                    uri = upload_to_gcs(pdf_path, drug_name, bucket_name=gcs_bucket)
-                    uploaded_uris.append(uri)
-                    print("done")
-                except Exception as exc:
-                    print(f"FAILED\n    ERROR: {exc}")
+            # Save the PDF locally next to the script so it survives
+            # the TemporaryDirectory cleanup.
+            local_pdf_path = os.path.abspath(
+                f"{drug_filter.safe_name(drug_name)}_Patent_Thicket_Analysis.pdf"
+            )
+            shutil.copy2(pdf_path, local_pdf_path)
+            print(f"\n[4/4] PDF saved locally")
+            print(f"    {local_pdf_path}")
+            saved_paths.append(local_pdf_path)
 
-    if local_only:
-        print("\n  Local-only run completed. No BigQuery write-back or GCS upload was performed.")
-    else:
-        print(f"\n  {len(uploaded_uris)} PDF(s) uploaded successfully.")
-        for uri in uploaded_uris:
-            print(f"    {uri}")
+    print(f"\n  {len(saved_paths)} PDF(s) saved locally.")
+    for p in saved_paths:
+        print(f"    {p}")
 
 
 if __name__ == "__main__":
@@ -1370,12 +1360,8 @@ if __name__ == "__main__":
     parser.add_argument("--key-file", default="",
                         help="Service account JSON path (overrides GOOGLE_APPLICATION_CREDENTIALS)")
     parser.add_argument("--location", default="", help="BigQuery location")
-    parser.add_argument("--bucket",   default="cognito-gcs",
-                        help="GCS bucket name (default: cognito-gcs)")
     parser.add_argument("--drug", default="",
                         help="Run report for a single drug/molecule only")
-    parser.add_argument("--local-only", action="store_true",
-                        help="Generate the PDF locally only; skip BigQuery write-back and GCS upload")
     parser.add_argument("--no-direct-render", action="store_true",
                         help="Use docx→mammoth→xhtml2pdf instead of direct HTML render")
     args = parser.parse_args()
@@ -1388,7 +1374,5 @@ if __name__ == "__main__":
 
     generate_report(
         args.api_key,
-        gcs_bucket=args.bucket,
         drug_name=args.drug,
-        local_only=args.local_only,
     )
