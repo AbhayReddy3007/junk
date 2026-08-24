@@ -738,6 +738,10 @@ def _build_html_for_drug(entry: dict) -> str:
     if jurs:
         jur_section = f"""
         <h2>Score Breakdown by Jurisdiction</h2>
+        <p style="font-size:0.85em;color:#555;margin:4px 0 10px 0;">
+          <b>Density</b> — number of non-blocking patents present in the thicket.&nbsp;&nbsp;
+          <b>Diversity</b> — number of distinct technology categories/areas covered by non-blocking patents.
+        </p>
         <table>
           <thead><tr>
             <th>Jurisdiction</th><th>Density</th><th>Diversity</th>
@@ -1115,6 +1119,27 @@ def build_document(drugs_list: list, output_path: str):
 
         if jurs:
             _heading(doc, "Score Breakdown by Jurisdiction")
+            note = doc.add_paragraph()
+            note.paragraph_format.space_before = Pt(2)
+            note.paragraph_format.space_after  = Pt(6)
+            _r_density = note.add_run("Density")
+            _r_density.bold = True
+            _r_density.font.size = Pt(8)
+            _r_density.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
+            _r_sep1 = note.add_run(
+                " \u2014 number of non-blocking patents present in the thicket.     "
+            )
+            _r_sep1.font.size = Pt(8)
+            _r_sep1.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
+            _r_diversity = note.add_run("Diversity")
+            _r_diversity.bold = True
+            _r_diversity.font.size = Pt(8)
+            _r_diversity.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
+            _r_sep2 = note.add_run(
+                " \u2014 number of distinct technology categories/areas covered by non-blocking patents."
+            )
+            _r_sep2.font.size = Pt(8)
+            _r_sep2.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
             jtbl = doc.add_table(rows=1 + len(jurs), cols=6)
             jtbl.alignment = WD_TABLE_ALIGNMENT.CENTER
             jh = jtbl.rows[0].cells
