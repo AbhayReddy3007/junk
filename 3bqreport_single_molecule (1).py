@@ -41,6 +41,11 @@ import argparse
 import tempfile
 from datetime import datetime, timezone
 
+
+def _safe_name(name: str) -> str:
+    """Return a filesystem-safe version of a drug name."""
+    return re.sub(r"[^\w\-]+", "_", name).strip("_")
+
 from docx import Document
 from docx.shared import Pt, Emu, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -1047,7 +1052,7 @@ def upload_to_gcs(local_pdf: str, drug_name: str,
             "Run: pip install google-cloud-storage --break-system-packages"
         )
 
-    safe_drug = drug_filter.safe_name(drug_name)
+    safe_drug = _safe_name(drug_name)
     blob_name = f"Cognito_new/reports/{safe_drug}/Patent_Thicket_Analysis.pdf"
 
     credentials = _get_credentials()
@@ -1305,7 +1310,7 @@ def generate_report(
     with tempfile.TemporaryDirectory() as tmpdir:
         for entry in drugs_list:
             drug_name = entry["drug_name"]
-            safe_drug = drug_filter.safe_name(drug_name)
+            safe_drug = _safe_name(drug_name)
             pdf_path  = os.path.join(tmpdir, f"{safe_drug}.pdf")
 
             print(f"\n  [{drug_name}]")
@@ -1337,7 +1342,7 @@ def generate_report(
             # Save the PDF locally next to the script so it survives
             # the TemporaryDirectory cleanup.
             local_pdf_path = os.path.abspath(
-                f"{drug_filter.safe_name(drug_name)}_Patent_Thicket_Analysis.pdf"
+                f"{_safe_name(drug_name)}_Patent_Thicket_Analysis.pdf"
             )
             shutil.copy2(pdf_path, local_pdf_path)
             print(f"\n[4/4] PDF saved locally")
