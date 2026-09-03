@@ -289,13 +289,12 @@ def _resolve_single_moa(moa: str) -> tuple[str, str | None, str | None]:
 
 def resolve_moa_targets(raw_moas: list[str], cache: dict) -> dict[str, tuple[str | None, str | None]]:
     """
-    Resolve MoA strings → OT targets.
-    Uses cache; resolves missing ones in parallel (WORKERS threads).
-    MoAs are individual (not batched) since there are usually few of them.
+    Resolve MoA strings → OT targets from cache only.
+    MoAs not found in cache are skipped with a warning (no Gemini calls).
+    OpenTargets scores are always fetched fresh on every run.
     """
     target_map: dict[str, tuple[str | None, str | None]] = {}
-    cached     = cache.get("moa_targets", {})
-    to_resolve = []
+    cached = cache.get("moa_targets", {})
 
     for moa in raw_moas:
         if moa in cached:
@@ -303,18 +302,8 @@ def resolve_moa_targets(raw_moas: list[str], cache: dict) -> dict[str, tuple[str
             target_map[moa] = (entry.get("id"), entry.get("symbol"))
             log.info("  💾 Cache hit MoA '%s' → %s (%s)", moa, entry.get("id"), entry.get("symbol"))
         else:
-            to_resolve.append(moa)
-
-    if to_resolve:
-        with ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="moa") as exe:
-            futures = {exe.submit(_resolve_single_moa, moa): moa for moa in to_resolve}
-            for fut in as_completed(futures):
-                moa, ensg, symbol = fut.result()
-                target_map[moa] = (ensg, symbol)
-                cached[moa] = {"id": ensg, "symbol": symbol}
-
-        cache["moa_targets"] = cached
-        save_cache(cache)
+            log.warning("  ⚠️  MoA '%s' not found in cache — skipping (run resolution first)", moa)
+            target_map[moa] = (None, None)
 
     return target_map
 
@@ -486,56 +475,22 @@ def resolve_indications(
     cache: dict,
 ) -> dict[str, tuple[str | None, str | None]]:
     """
-    Resolve indications → OT diseases.
-    - Uses cache for already-resolved items.
-    - Groups remaining into batches of BATCH_SIZE.
-    - Runs batches in parallel across WORKERS threads.
+    Resolve indications → OT diseases from cache only.
+    Indications not found in cache are skipped with a warning (no Gemini calls).
+    OpenTargets scores are always fetched fresh on every run.
     """
     ind_map: dict[str, tuple[str | None, str | None]] = {}
     cached  = cache.get("indications", {})
-    to_resolve = []
 
     for ind in unique_indications:
         if ind in cached:
             entry = cached[ind]
             ind_map[ind] = (entry.get("id"), entry.get("name"))
-            log.info("  💾 Cache hit indication '%s' → %s", ind, entry.get("id"))
+            log.info("  💾 Cache hit indication '%s' → %s (%s)", ind, entry.get("id"), entry.get("name"))
         else:
-            to_resolve.append(ind)
+            log.warning("  ⚠️  Indication '%s' not found in cache — skipping (run resolution first)", ind)
+            ind_map[ind] = (None, None)
 
-    if not to_resolve:
-        return ind_map
-
-    # Split into batches of BATCH_SIZE
-    batches = [
-        to_resolve[i: i + BATCH_SIZE]
-        for i in range(0, len(to_resolve), BATCH_SIZE)
-    ]
-    log.info("  📦 %d indications → %d batch(es) × %d worker(s)",
-             len(to_resolve), len(batches), WORKERS)
-
-    with ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="ind") as exe:
-        future_to_batch = {
-            exe.submit(_resolve_indication_batch, batch): batch
-            for batch in batches
-        }
-        for fut in as_completed(future_to_batch):
-            try:
-                results = fut.result()
-            except Exception as exc:
-                log.error("Batch future failed: %s", exc)
-                results = [(ind, None, None) for ind in future_to_batch[fut]]
-
-            for ind, did, dname in results:
-                ind_map[ind] = (did, dname)
-                cached[ind]  = {"id": did, "name": dname}
-                if did:
-                    log.info("    ✅ '%s' → %s (%s)", ind, did, dname)
-                else:
-                    log.warning("    ⚠️  No OT disease found for '%s'", ind)
-
-    cache["indications"] = cached
-    save_cache(cache)
     return ind_map
 
 
@@ -665,12 +620,12 @@ def main():
 
     cache = load_cache()
 
-    # ── Step 1: MoA → targets ──────────────────────────────────────────────────
-    log.info("\n── Step 1: Resolving MoA targets ─────────────────────────────────")
+    # ── Step 1: MoA → targets (cache-only) ────────────────────────────────────
+    log.info("\n── Step 1: Loading MoA targets from cache ────────────────────────")
     target_map = resolve_moa_targets(raw_moas, cache)
 
-    # ── Step 2: Indications → diseases ────────────────────────────────────────
-    log.info("\n── Step 2: Resolving indications → OT diseases ───────────────────")
+    # ── Step 2: Indications → diseases (cache-only) ────────────────────────────
+    log.info("\n── Step 2: Loading indications from cache ────────────────────────")
     ind_map = resolve_indications(unique_inds, cache)
 
     # ── Step 3: Association scores ─────────────────────────────────────────────
