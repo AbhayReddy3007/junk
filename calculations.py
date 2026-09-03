@@ -302,21 +302,20 @@ def add_w_dose(df: pd.DataFrame, drug_col: str) -> pd.DataFrame:
     Add column 'w_dose'.
 
     Logic:
-      - Group rows by (drug, dosage).
-      - Within each such group, identify the distinct TA-I values and rank
-        them by their highest phase (descending).
-      - The TA-I with the highest phase in the group gets w_dose = 1.00.
-      - The TA-I with the next-highest phase gets w_dose = 0.75.
-      - If a drug has only one dosage (or all TA-Is share the same dosage),
-        all its rows receive w_dose = 1.00.
-      - Rows with missing dosage are treated as a group by themselves and all
-        receive w_dose = 1.00 (no relative ranking is possible).
+      - Group rows by (TA-I, dosage).
+      - Within each such group, rank the rows by their phase (descending).
+      - The row with the highest phase in the group gets w_dose = 1.00.
+      - The row with the next-highest phase gets w_dose = 0.75.
+      - If a TA-I has only one dosage, or all rows in the group share the
+        same phase, all rows in that group receive w_dose = 1.00.
+      - Rows with missing dosage are isolated into their own per-TA-I group
+        and all receive w_dose = 1.00 (no relative ranking is possible).
 
-    "Highest phase" within a TA-I is the maximum _phase_rank across all rows
-    of that (drug, dosage, TA-I) combination, so a TA-I that appears at
-    multiple phases is ranked by its most advanced one.
+    "Highest phase" for a row is determined by _phase_rank applied to its
+    phase value. Ties within a group receive the same rank and therefore the
+    same w_dose (dense ranking).
     """
-    required = {drug_col, "dosage", "TA - I", "phase"}
+    required = {"TA - I", "dosage", "phase"}
     missing_cols = required - set(df.columns)
     if missing_cols:
         print(
@@ -326,7 +325,7 @@ def add_w_dose(df: pd.DataFrame, drug_col: str) -> pd.DataFrame:
         df["w_dose"] = 1.0
         return df
 
-    # Build a normalised dosage key: strip, lower, treat missing as sentinel
+    # Normalise dosage: strip whitespace, lowercase, sentinel for missing
     _MISSING_DOSE_SENTINEL = "__missing__"
 
     def _norm_dose(val):
@@ -335,26 +334,12 @@ def add_w_dose(df: pd.DataFrame, drug_col: str) -> pd.DataFrame:
         return str(val).strip().lower()
 
     df["_dose_key"] = df["dosage"].apply(_norm_dose)
-
-    # For each (drug, dosage) group, find the best phase rank per TA-I
-    # then assign rank 1 → w_dose=1.0, rank 2 → w_dose=0.75, rank 3+ → 0.75
-    # (only two distinct weights are specified, so rank≥2 all get 0.75)
     df["_phase_rank_num"] = df["phase"].apply(_phase_rank)
 
-    # Maximum phase rank per (drug, dosage, TA-I)
-    group_keys = [drug_col, "_dose_key", "TA - I"]
-    ta_max_phase = (
-        df.groupby(group_keys, sort=False)["_phase_rank_num"]
-        .max()
-        .reset_index()
-        .rename(columns={"_phase_rank_num": "_ta_max_phase"})
-    )
-
-    # Within each (drug, dosage) group, dense-rank the TA-Is by max phase DESC
-    # dense_rank so ties receive the same rank (both would get the same w_dose)
-    ta_max_phase["_dose_rank"] = (
-        ta_max_phase
-        .groupby([drug_col, "_dose_key"], sort=False)["_ta_max_phase"]
+    # Within each (TA-I, dosage) group, dense-rank rows by phase DESC.
+    # Ties share the same rank → same w_dose.
+    df["_dose_rank"] = (
+        df.groupby(["TA - I", "_dose_key"], sort=False)["_phase_rank_num"]
         .rank(method="dense", ascending=False)
         .astype(int)
     )
@@ -364,21 +349,12 @@ def add_w_dose(df: pd.DataFrame, drug_col: str) -> pd.DataFrame:
             return 1.00
         return 0.75   # rank 2 and beyond
 
-    ta_max_phase["_w_dose"] = ta_max_phase["_dose_rank"].apply(_dose_rank_to_weight)
+    df["w_dose"] = df["_dose_rank"].apply(_dose_rank_to_weight)
 
-    # Rows with missing dosage get w_dose = 1.0 regardless of rank
-    ta_max_phase.loc[
-        ta_max_phase["_dose_key"] == _MISSING_DOSE_SENTINEL, "_w_dose"
-    ] = 1.0
+    # Rows with missing dosage always get w_dose = 1.0 regardless of rank
+    df.loc[df["_dose_key"] == _MISSING_DOSE_SENTINEL, "w_dose"] = 1.0
 
-    # Merge back onto df
-    df = df.merge(
-        ta_max_phase[[drug_col, "_dose_key", "TA - I", "_w_dose"]],
-        on=[drug_col, "_dose_key", "TA - I"],
-        how="left",
-    )
-    df["w_dose"] = df["_w_dose"].fillna(1.0)
-    df = df.drop(columns=["_dose_key", "_phase_rank_num", "_w_dose"])
+    df = df.drop(columns=["_dose_key", "_phase_rank_num", "_dose_rank"])
 
     print(f"  [5] 'w_dose' added.  Value counts:\n{df['w_dose'].value_counts().to_string()}")
     return df
