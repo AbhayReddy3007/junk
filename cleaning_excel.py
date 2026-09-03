@@ -108,20 +108,30 @@ def process():
         print("Step 2 done: 'TA - I' column added.")
 
         # -------------------------------------------------------------------
-        # 3. Deduplicate TA - I by keeping highest-phase row
+        # 3. Deduplicate TA - I by keeping highest-phase row(s).
+        #    If multiple rows share the same TA - I AND the same (highest)
+        #    phase, all of them are kept.
         # -------------------------------------------------------------------
         if "phase" not in df.columns:
             print("WARNING: Column 'phase' not found. Skipping deduplication (step 3).")
         else:
             df["_phase_rank"] = df["phase"].apply(phase_rank)
 
-            df_sorted = df.sort_values("_phase_rank", ascending=False)
-            df = df_sorted.drop_duplicates(subset=["TA - I"], keep="first")
-            df = df.sort_index()
-            df = df.drop(columns=["_phase_rank"])
+            # Find the maximum phase rank per TA - I group
+            df["_max_rank"] = df.groupby("TA - I")["_phase_rank"].transform("max")
 
-            rows_removed = len(df_sorted) - len(df)
-            print(f"Step 3 done: {rows_removed} duplicate TA - I row(s) removed (lower-phase kept out).")
+            original_count = len(df)
+
+            # Keep only rows whose rank equals the group maximum
+            # (drops lower-phase rows; keeps all rows tied at the top phase)
+            df = df[df["_phase_rank"] == df["_max_rank"]]
+
+            df = df.sort_index()
+            df = df.drop(columns=["_phase_rank", "_max_rank"])
+
+            rows_removed = original_count - len(df)
+            print(f"Step 3 done: {rows_removed} lower-phase duplicate TA - I row(s) removed. "
+                  f"Rows tied at the highest phase were all kept.")
 
     # -----------------------------------------------------------------------
     # Write output
