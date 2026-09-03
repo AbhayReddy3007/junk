@@ -15,7 +15,7 @@ IMPORTANT — definition of 'size':
     size = number of patients in the drug/treatment arm(s) only.
     This EXCLUDES placebo, healthy volunteers, and control-only arms.
     It is the same concept as drug_arm_size_n.
-    Do NOT use total enrollment (enrollmentInfo.count) for size.
+    If drug-arm-only count cannot be determined, falls back to total enrollment.
 
 .env variables required:
     OUTPUT_FILE                    - Path to the input Excel file
@@ -176,19 +176,23 @@ def _extract_drug_arm_size(study) -> int | None:
     Extract the number of patients in drug/treatment arms only.
     This is what 'size' means: drug arm population, not total enrollment.
 
-    Tries three sources in priority order:
+    Tries sources in priority order:
       1. armsInterventionsModule.armGroups[].count  (direct per-arm count)
       2. resultsSection.participantFlowModule        (completed trials with posted results)
-      3. Falls back to total enrollmentInfo.count ONLY if the trial has exactly one
-         arm (i.e. single-arm — all participants are in the drug arm)
+      3. Total enrollment if the trial has exactly one arm (single-arm — all participants
+         are in the drug arm)
+      4. FALLBACK: Total enrollment (enrollmentInfo.count) as best-effort approximation
+         when drug-arm count cannot be determined any other way. This is logged clearly.
     """
     protocol = study.get("protocolSection", {})
     arms = protocol.get("armsInterventionsModule", {}).get("armGroups", [])
 
     # Source 1: per-arm count field (sometimes populated for ongoing trials)
     drug_arm_total = None
+    has_any_drug_arm = False
     for arm in arms:
         if _is_drug_arm(arm.get("type", ""), arm.get("label", "")):
+            has_any_drug_arm = True
             count = arm.get("count")
             if count is not None:
                 try:
@@ -227,19 +231,34 @@ def _extract_drug_arm_size(study) -> int | None:
         if found:
             return total
 
+    # Get total enrollment for sources 3 and 4
+    enroll_count = (
+        protocol.get("designModule", {})
+                .get("enrollmentInfo", {})
+                .get("count")
+    )
+
     # Source 3: single-arm trial — total enrollment == drug arm size
     n_arms = len(arms)
     if n_arms <= 1:
-        enroll_count = (
-            protocol.get("designModule", {})
-                    .get("enrollmentInfo", {})
-                    .get("count")
-        )
         if enroll_count is not None:
             try:
                 return int(enroll_count)
             except (ValueError, TypeError):
                 pass
+
+    # Source 4: FALLBACK — use total enrollment as best-effort approximation.
+    # This is intentionally broad: for multi-arm trials where per-arm counts are
+    # unavailable, total enrollment is the closest available proxy. Log it clearly.
+    if enroll_count is not None:
+        try:
+            val = int(enroll_count)
+            nct_id = protocol.get("identificationModule", {}).get("nctId", "?")
+            print(f"      [size fallback] {nct_id}: using total enrollment ({val}) — "
+                  f"per-arm counts unavailable (arms={n_arms}, drug_arms={has_any_drug_arm})")
+            return val
+        except (ValueError, TypeError):
+            pass
 
     return None
 
@@ -248,7 +267,8 @@ def _fetch_one_nct(nct_id, retries=4, delay=2.0):
     """
     Fetch a single NCT study from ClinicalTrials.gov v2.
     Returns dict with primary_region, size, drug_arm_size_n — or None on failure.
-    size and drug_arm_size_n are both set to the drug-arm-only patient count.
+    size and drug_arm_size_n are both set to the drug-arm-only patient count
+    (or best-effort total enrollment if arm-level data is unavailable).
     """
     params = urllib.parse.urlencode({"filter.ids": nct_id, "pageSize": 1})
     url = f"https://clinicaltrials.gov/api/v2/studies?{params}"
@@ -294,7 +314,7 @@ def _fetch_one_nct(nct_id, retries=4, delay=2.0):
         print(f"    CT.gov ID mismatch for {nct_id} (got {returned_nct}), skipping.")
         return None
 
-    # Drug-arm patient count (= size = drug_arm_size_n)
+    # Drug-arm patient count (= size = drug_arm_size_n), with fallback to total enrollment
     drug_arm_size = _extract_drug_arm_size(study)
 
     # Primary region from site locations
@@ -304,24 +324,29 @@ def _fetch_one_nct(nct_id, retries=4, delay=2.0):
 
     return {
         "primary_region": primary_region,
-        # Both columns represent drug-arm patient count
+        # Both columns represent drug-arm patient count (or best-effort total enrollment)
         "size": drug_arm_size,
         "drug_arm_size_n": drug_arm_size,
     }
 
 
 def clinicaltrials_lookup(trial_ids, rate_limit_delay=0.5):
-    nct_ids = [t for t in trial_ids if re.match(r"^NCT\d+", t, re.IGNORECASE)]
+    """
+    Look up ALL provided trial IDs that match the NCT pattern.
+    Returns a dict keyed by trial_id (uppercased) with the fetched fields.
+    """
+    nct_ids = [t for t in trial_ids if re.match(r"^NCT\d+", str(t).strip(), re.IGNORECASE)]
     results = {}
     if not nct_ids:
         return results
 
     print(f"  Querying ClinicalTrials.gov for {len(nct_ids)} NCT ID(s) ...")
     for i, nct_id in enumerate(nct_ids, 1):
-        print(f"    [{i}/{len(nct_ids)}] {nct_id} ...", end=" ", flush=True)
-        result = _fetch_one_nct(nct_id)
+        nct_id_clean = str(nct_id).strip().upper()
+        print(f"    [{i}/{len(nct_ids)}] {nct_id_clean} ...", end=" ", flush=True)
+        result = _fetch_one_nct(nct_id_clean)
         if result:
-            results[nct_id] = result
+            results[nct_id_clean] = result
             print(", ".join(f"{k}={v}" for k, v in result.items()))
         else:
             print("not found")
@@ -349,9 +374,10 @@ For each trial find:
 - size: The number of patients enrolled in the DRUG or TREATMENT arm(s) only.
   EXCLUDE placebo recipients, healthy volunteers, and control-only arms.
   If the trial is single-arm, all enrolled patients count.
-  This is NOT the total enrollment — it is the treated patient population only.
+  If per-arm counts are not available, use total enrollment as a best-effort value.
+  Do NOT leave this null if any enrollment figure is available.
 
-- drug_arm_size_n: Same value as size (drug/treatment arm patients only).
+- drug_arm_size_n: Same value as size (drug/treatment arm patients only, or total enrollment if arm-level unavailable).
 
 Return ONLY a valid JSON array, no explanation, no markdown fences:
 [
@@ -359,7 +385,7 @@ Return ONLY a valid JSON array, no explanation, no markdown fences:
   {{"trial_id": "NCT87654321", "primary_region": "Europe", "size": 200, "drug_arm_size_n": 200}}
 ]
 
-Use null only if the value genuinely cannot be found after searching. Do not guess. Do not return total enrollment as size.
+Use null only if the value genuinely cannot be found after searching. Do not guess.
 """
 
 
@@ -414,7 +440,7 @@ def gemini_fallback(trial_ids, api_key, batch_size):
         try:
             entries = _gemini_lookup_batch(batch, api_key)
             for entry in entries:
-                tid = str(entry.get("trial_id", "")).strip()
+                tid = str(entry.get("trial_id", "")).strip().upper()
                 if tid:
                     results[tid] = entry
         except Exception as e:
@@ -430,8 +456,10 @@ def gemini_fallback(trial_ids, api_key, batch_size):
 
 def fill_missing_fields(df, api_key, batch_size):
     """
-    Fills primary_region, size, and drug_arm_size_n wherever missing.
-    size and drug_arm_size_n both represent the drug-arm patient count.
+    For EVERY row in the dataframe, fills primary_region, size, and drug_arm_size_n
+    wherever missing. Operates on all rows, not just a pre-filtered subset.
+    size and drug_arm_size_n both represent the drug-arm patient count (or total
+    enrollment as a best-effort fallback when arm-level data is unavailable).
     """
     target_cols = ["primary_region", "size", "drug_arm_size_n"]
 
@@ -442,30 +470,42 @@ def fill_missing_fields(df, api_key, batch_size):
     def _needs_fill(row):
         return any(is_missing(row.get(col)) for col in target_cols)
 
-    any_missing_mask = df.apply(_needs_fill, axis=1)
-    needs_fill_idx = df.index[any_missing_mask].tolist()
-
-    if not needs_fill_idx:
-        print("Step 6: No rows with missing fields. Skipping fallback.")
-        return df
-
     print(f"\nStep 6 — Missing field summary (before fallback):")
     print(f"  Total rows : {len(df)}")
     for col in target_cols:
         print(f"  Missing {col:25s}: {df[col].apply(is_missing).sum()} row(s)")
 
-    unique_trials = [
-        t for t in df.loc[needs_fill_idx, "trial_id"].dropna().unique()
-        if str(t).strip().lower() not in ("", "nan")
-    ]
-    print(f"\n  {len(needs_fill_idx)} row(s) across {len(unique_trials)} unique trial ID(s) need fallback.")
+    # Collect ALL unique trial IDs that have at least one missing field
+    # (not just a subset of row indices — every row for that trial needs filling)
+    missing_per_trial = {}
+    for _, row in df.iterrows():
+        if not _needs_fill(row):
+            continue
+        tid = str(row.get("trial_id", "")).strip().upper()
+        if not tid or tid in ("", "NAN", "NONE"):
+            continue
+        if tid not in missing_per_trial:
+            missing_per_trial[tid] = set()
+        for col in target_cols:
+            if is_missing(row.get(col)):
+                missing_per_trial[tid].add(col)
 
-    # ---- 6a: ClinicalTrials.gov ----
-    ctgov_results = clinicaltrials_lookup(unique_trials)
+    unique_trials_needing_fill = list(missing_per_trial.keys())
+    total_missing_rows = df.apply(_needs_fill, axis=1).sum()
+    print(f"\n  {total_missing_rows} row(s) across "
+          f"{len(unique_trials_needing_fill)} unique trial ID(s) need fallback.")
 
+    if not unique_trials_needing_fill:
+        print("Step 6: No rows with missing fields. Skipping fallback.")
+        return df
+
+    # ---- 6a: ClinicalTrials.gov — query ALL NCT IDs that need any field ----
+    ctgov_results = clinicaltrials_lookup(unique_trials_needing_fill)
+
+    # Apply CT.gov results to ALL rows for each matched trial_id
     filled_ctgov = 0
-    for idx in needs_fill_idx:
-        tid = str(df.at[idx, "trial_id"]).strip()
+    for idx in df.index:
+        tid = str(df.at[idx, "trial_id"]).strip().upper()
         entry = ctgov_results.get(tid)
         if not entry:
             continue
@@ -476,21 +516,33 @@ def fill_missing_fields(df, api_key, batch_size):
     print(f"  CT.gov filled {filled_ctgov} cell(s).")
 
     # ---- 6b: Gemini for anything still missing ----
-    still_missing_mask = df.apply(_needs_fill, axis=1)
-    still_missing_idx = df.index[still_missing_mask & any_missing_mask].tolist()
+    # Recompute which trial IDs still have missing fields after CT.gov pass
+    still_missing_per_trial = {}
+    for _, row in df.iterrows():
+        if not _needs_fill(row):
+            continue
+        tid = str(row.get("trial_id", "")).strip().upper()
+        if not tid or tid in ("", "NAN", "NONE"):
+            continue
+        if tid not in still_missing_per_trial:
+            still_missing_per_trial[tid] = set()
+        for col in target_cols:
+            if is_missing(row.get(col)):
+                still_missing_per_trial[tid].add(col)
 
-    still_missing_trials = [
-        t for t in df.loc[still_missing_idx, "trial_id"].dropna().unique()
-        if str(t).strip().lower() not in ("", "nan")
-    ]
+    still_missing_trials = list(still_missing_per_trial.keys())
 
     if still_missing_trials:
         print(f"  {len(still_missing_trials)} trial(s) still missing fields → Gemini ...")
+        for tid, cols in still_missing_per_trial.items():
+            print(f"    {tid}: missing {sorted(cols)}")
+
         gemini_results = gemini_fallback(still_missing_trials, api_key, batch_size)
 
+        # Apply Gemini results to ALL rows for each matched trial_id
         filled_gemini = 0
-        for idx in still_missing_idx:
-            tid = str(df.at[idx, "trial_id"]).strip()
+        for idx in df.index:
+            tid = str(df.at[idx, "trial_id"]).strip().upper()
             entry = gemini_results.get(tid)
             if not entry:
                 continue
@@ -508,10 +560,14 @@ def fill_missing_fields(df, api_key, batch_size):
     for col in target_cols:
         print(f"  Still missing {col:20s}: {df[col].apply(is_missing).sum()} row(s)")
 
-    still_any = df.apply(_needs_fill, axis=1)
-    remaining = df.loc[still_any, ["trial_id"] + target_cols].drop_duplicates("trial_id")
+    # Report any trial IDs that remain unresolved
+    still_any_mask = df.apply(_needs_fill, axis=1)
+    remaining = (
+        df.loc[still_any_mask, ["trial_id"] + target_cols]
+        .drop_duplicates("trial_id")
+    )
     if not remaining.empty:
-        print("  Unresolved trial IDs:")
+        print("  Unresolved trial IDs (still have missing fields):")
         for _, row in remaining.iterrows():
             gaps = [c for c in target_cols if is_missing(row[c])]
             print(f"    {row['trial_id']} — still missing: {gaps}")
@@ -611,11 +667,22 @@ def process():
         bq_df["trial_id"] = bq_df["trial_id"].astype(str).str.strip()
 
         bq_cols = ["trial_id", "primary_region", "secondary_countries", "size", "drug_arm_size_n"]
+
+        # Deduplicate BQ rows per trial_id — prefer rows with the most non-null values
+        # to avoid merge-induced NaN from duplicate BQ entries
+        bq_df = bq_df[bq_cols].copy()
+        bq_df["_non_null_count"] = bq_df[["primary_region", "secondary_countries", "size", "drug_arm_size_n"]].notna().sum(axis=1)
+        bq_df = (
+            bq_df.sort_values("_non_null_count", ascending=False)
+                 .drop_duplicates(subset=["trial_id"], keep="first")
+                 .drop(columns=["_non_null_count"])
+        )
+
         existing = [c for c in bq_cols if c != "trial_id" and c in df.columns]
         if existing:
             df = df.drop(columns=existing)
 
-        df = df.merge(bq_df[bq_cols], on="trial_id", how="left")
+        df = df.merge(bq_df, on="trial_id", how="left")
 
         bq_matched = df["secondary_countries"].notna()
         print("Step 5 done: BQ columns joined.")
@@ -625,7 +692,7 @@ def process():
         for col in ["primary_region", "size", "drug_arm_size_n"]:
             print(f"  Missing {col:25s}: {df[col].apply(is_missing).sum()}")
 
-    # 6. Fill all missing fields
+    # 6. Fill all missing fields — processes EVERY row in the dataframe
     if "trial_id" in df.columns:
         df = fill_missing_fields(df, gemini_api_key, batch_size)
 
@@ -635,4 +702,3 @@ def process():
 
 if __name__ == "__main__":
     process()
-PYEOF
