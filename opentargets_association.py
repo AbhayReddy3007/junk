@@ -32,6 +32,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 INPUT_FILE     = os.getenv("INPUT_FILE", "").strip()
 OUTPUT_FILE    = os.getenv("OUTPUT_FILE", "").strip()
 SHEET_NAME     = os.getenv("SHEET_NAME", "").strip() or None   # None → first sheet
@@ -58,7 +59,7 @@ log = logging.getLogger(__name__)
 # ── Constants ──────────────────────────────────────────────────────────────────
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 )
 OT_GRAPHQL = "https://api.platform.opentargets.org/api/v4/graphql"
 
