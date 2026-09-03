@@ -132,7 +132,7 @@ def gemini_lookup(trial_ids: list[str], api_key: str) -> list[dict]:
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-2.5-flash-lite:generateContent"
+        "gemini-3.5-flash:generateContent"
     )
 
     payload = {
@@ -144,11 +144,12 @@ def gemini_lookup(trial_ids: list[str], api_key: str) -> list[dict]:
         "tools": [{"google_search": {}}],
         "generationConfig": {
             "temperature": 0,
-            # Must be nested inside generationConfig, not top-level.
-            # gemini-2.5-flash-lite doesn't think by default, but being
-            # explicit prevents the model from thinking if that changes.
+            # Gemini 3 models use thinkingLevel, not thinkingBudget.
+            # "minimal" is the lowest thinking level available for Gemini 3 Flash,
+            # keeping latency and token usage as low as possible.
+            # Do NOT use thinkingBudget here — mixing the two causes a 400 error.
             "thinkingConfig": {
-                "thinkingBudget": 0
+                "thinkingLevel": "minimal"
             },
         },
     }
