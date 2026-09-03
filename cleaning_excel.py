@@ -6,14 +6,18 @@ Excel Processing Script
 3. Deduplicates TA - I rows, keeping the highest-phase row per combination.
    Phase priority: Approved > 3 > 2 > 1 (fuzzy-matched).
 
-Output path is read from OUTPUT_FILE in .env (falls back to input_processed.xlsx).
+Input path is read from OUTPUT_FILE in .env.
+Output is saved alongside the input file as <input_stem>_processed.xlsx.
 
 Usage:
-    python process_excel.py input.xlsx
+    python process_excel.py
+
+.env example:
+    OUTPUT_FILE=path/to/your/input.xlsx
 """
 
-import sys
 import re
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -22,7 +26,6 @@ import os
 
 # Load variables from .env file (looks for .env in the current working directory)
 load_dotenv()
-
 
 
 # ---------------------------------------------------------------------------
@@ -42,15 +45,13 @@ def phase_rank(phase_value) -> int:
     if "approved" in text or "approv" in text or "market" in text:
         return 4
 
-    # Extract numeric portion (e.g. "Phase 3", "3", "P3", "Phase III", "III")
-    # Roman numeral support
+    # Roman numeral support (e.g. "Phase III", "III")
     roman = {"iii": 3, "ii": 2, "i": 1, "iv": 4}
     for numeral, val in roman.items():
-        # Match standalone roman numeral (word boundary)
         if re.search(rf"\b{numeral}\b", text):
             return val
 
-    # Arabic digit
+    # Arabic digit (e.g. "Phase 3", "P3", "3")
     m = re.search(r"\b([1-4])\b", text)
     if m:
         return int(m.group(1))
@@ -62,20 +63,24 @@ def phase_rank(phase_value) -> int:
 # Main processing
 # ---------------------------------------------------------------------------
 
-def process(input_path: str, output_path: str | None = None):
-    input_path = Path(input_path)
+def process():
+    # Read input path from OUTPUT_FILE in .env
+    input_file = os.getenv("OUTPUT_FILE")
+    if not input_file:
+        print("ERROR: OUTPUT_FILE is not set in .env")
+        sys.exit(1)
 
-    # Resolve output path: argument > OUTPUT_FILE in .env > default
-    if output_path is not None:
-        output_path = Path(output_path)
-    elif os.getenv("OUTPUT_FILE"):
-        output_path = Path(os.getenv("OUTPUT_FILE"))
-        print(f"Output path loaded from .env OUTPUT_FILE: {output_path}")
-    else:
-        output_path = input_path.with_name(input_path.stem + "_processed.xlsx")
-        print(f"OUTPUT_FILE not set in .env. Defaulting to: {output_path}")
+    input_path = Path(input_file)
+    if not input_path.exists():
+        print(f"ERROR: File not found: {input_path}")
+        sys.exit(1)
 
-    print(f"Reading: {input_path}")
+    # Output saved next to the input file
+    output_path = input_path.with_name(input_path.stem + "_processed.xlsx")
+
+    print(f"Input file  : {input_path}")
+    print(f"Output file : {output_path}")
+
     df = pd.read_excel(input_path)
 
     # -----------------------------------------------------------------------
@@ -84,9 +89,6 @@ def process(input_path: str, output_path: str | None = None):
     if "trial_id" not in df.columns:
         print("WARNING: Column 'trial_id' not found. Skipping step 1.")
     else:
-        # Remove any content within parentheses that comes AFTER the main ID
-        # Pattern: optional whitespace + opening paren + anything + closing paren
-        # anchored to the end (one or more such groups)
         df["trial_id"] = (
             df["trial_id"]
             .astype(str)
@@ -111,19 +113,11 @@ def process(input_path: str, output_path: str | None = None):
         if "phase" not in df.columns:
             print("WARNING: Column 'phase' not found. Skipping deduplication (step 3).")
         else:
-            # Compute numeric rank for sorting
             df["_phase_rank"] = df["phase"].apply(phase_rank)
 
-            # Sort so that highest rank comes first within each TA - I group
             df_sorted = df.sort_values("_phase_rank", ascending=False)
-
-            # Keep the first (highest-ranked) row per TA - I
             df = df_sorted.drop_duplicates(subset=["TA - I"], keep="first")
-
-            # Restore original row order (by original index)
             df = df.sort_index()
-
-            # Drop helper column
             df = df.drop(columns=["_phase_rank"])
 
             rows_removed = len(df_sorted) - len(df)
@@ -134,7 +128,6 @@ def process(input_path: str, output_path: str | None = None):
     # -----------------------------------------------------------------------
     df.to_excel(output_path, index=False)
     print(f"Output saved: {output_path}")
-    return output_path
 
 
 # ---------------------------------------------------------------------------
@@ -142,10 +135,4 @@ def process(input_path: str, output_path: str | None = None):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python process_excel.py input.xlsx")
-        print("       Output path is read from OUTPUT_FILE in .env")
-        sys.exit(1)
-
-    input_file = sys.argv[1]
-    process(input_file)
+    process()
