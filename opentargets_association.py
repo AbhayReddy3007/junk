@@ -301,83 +301,164 @@ def resolve_moa_targets(raw_moas: list[str], cache: dict) -> dict[str, tuple[str
 
 # ── Resolution: Indications (batched) ─────────────────────────────────────────
 
+def _clean_and_parse_json(text: str) -> list[dict]:
+    """
+    Robustly extract a JSON array from Gemini's free-text response.
+
+    Handles (in order of attempt):
+      1. Strip markdown fences and surrounding prose, then json.loads
+      2. Find the outermost [...] via bracket-counting (not regex, handles nesting)
+      3. Remove trailing commas and retry json.loads
+      4. Object-by-object extraction via {…} regex — handles newline-separated objects
+      5. Key-value regex extraction per object as last resort
+    """
+    # ── Step 1: strip markdown fences ─────────────────────────────────────────
+    cleaned = re.sub(r"```(?:json|JSON)?\s*", "", text)
+    cleaned = re.sub(r"```", "", cleaned).strip()
+
+    # ── Step 2: bracket-counting extraction of outermost [...] ────────────────
+    def _extract_array(s: str) -> str | None:
+        start = s.find("[")
+        if start == -1:
+            return None
+        depth = 0
+        for i, ch in enumerate(s[start:], start):
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    return s[start: i + 1]
+        return None  # unbalanced
+
+    array_str = _extract_array(cleaned)
+    if array_str:
+        # ── Step 3: fix trailing commas, then parse ────────────────────────
+        fixed = re.sub(r",\s*([\]\}])", r"\1", array_str)
+        try:
+            result = json.loads(fixed)
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError as e:
+            log.debug("json.loads failed after trailing-comma fix: %s", e)
+
+    # ── Step 4: object-by-object extraction ───────────────────────────────────
+    # Match {...} blocks that may span multiple lines
+    log.debug("Falling back to object-by-object extraction")
+    objects = re.findall(r"\{[^{}]+\}", cleaned, re.DOTALL)
+    results = []
+    for obj_str in objects:
+        obj_str = re.sub(r",\s*([\]\}])", r"\1", obj_str).strip()
+        try:
+            results.append(json.loads(obj_str))
+            continue
+        except json.JSONDecodeError:
+            pass
+        # ── Step 5: regex key-value fallback per object ───────────────────
+        ind_m  = re.search(r'"indication"\s*:\s*"([^"]*)"', obj_str)
+        id_m   = re.search(r'"id"\s*:\s*(?:"([^"]*?)"|null)', obj_str)
+        name_m = re.search(r'"name"\s*:\s*(?:"([^"]*?)"|null)', obj_str)
+        if ind_m or id_m:
+            results.append({
+                "indication": ind_m.group(1) if ind_m else "",
+                "id":         id_m.group(1)  if (id_m and id_m.group(1)) else None,
+                "name":       name_m.group(1) if (name_m and name_m.group(1)) else None,
+            })
+
+    if not results:
+        log.warning("_clean_and_parse_json: all strategies failed. Raw (500 chars): %s", text[:500])
+    return results
+
+
+def _verify_and_enrich(ind: str, did: str | None, name: str | None) -> tuple[str, str | None, str | None]:
+    """Verify disease ID via OT search, fall back to name search if needed."""
+    if did:
+        did = did.replace(":", "_")
+        verified_id, verified_name = ot_search_disease(did)
+        if verified_id:
+            return ind, verified_id, verified_name
+    # Fall back to plain text search
+    fb_id, fb_name = ot_search_disease(ind)
+    return ind, fb_id, fb_name
+
+
+def _resolve_single_indication(ind: str) -> tuple[str, str | None, str | None]:
+    """Resolve one indication via a dedicated single-item Gemini call."""
+    prompt = (
+        f"Search OpenTargets (platform.opentargets.org) for the disease that best "
+        f"matches the indication \"{ind}\". "
+        f'Return ONLY valid JSON (no prose, no fences): {{"indication": "{ind}", "id": "<EFO_/MONDO_/HP_ ID or null>", "name": "<OT disease name or null>"}}'
+    )
+    text = gemini_search(prompt)
+    log.debug("    Single fallback raw: %s", text[:300])
+    did, name = None, None
+    try:
+        objs = _clean_and_parse_json(text)
+        if objs:
+            obj  = objs[0] if isinstance(objs, list) else objs
+            did  = obj.get("id") or None
+            name = obj.get("name") or None
+    except Exception:
+        did = extract_id_from_text(text, "disease")
+    return _verify_and_enrich(ind, did, name)
+
+
 def _resolve_indication_batch(
     batch: list[str],
 ) -> list[tuple[str, str | None, str | None]]:
     """
     Resolve a batch of up to BATCH_SIZE indications in one Gemini call.
     Returns list of (indication, disease_id, disease_name).
-    Retries the whole batch once on failure, then falls back per-item.
+    - Retries the whole batch once on parse failure.
+    - Falls back to individual calls if batch still fails.
     """
     numbered = "\n".join(f"{i+1}. {ind}" for i, ind in enumerate(batch))
     prompt = (
-        "Search OpenTargets (platform.opentargets.org) for the best matching disease "
-        "for each of the following indications. "
-        "Return ONLY a JSON array — no prose, no markdown fences — where each element has:\n"
-        '  {"indication": "<original text>", "id": "<EFO_/MONDO_/HP_/DOID_ ID>", "name": "<OT disease name>"}\n'
-        "Use null for id/name if no match is found.\n\n"
-        f"Indications:\n{numbered}"
+        "You are a biomedical data assistant. Search OpenTargets Platform "
+        "(platform.opentargets.org) for the best matching disease for each indication below.\n\n"
+        "STRICT OUTPUT RULES:\n"
+        "- Output ONLY a valid JSON array. Nothing else. No prose. No markdown. No ```json fences.\n"
+        "- The array must have EXACTLY one object per indication, in the same order.\n"
+        "- Each object must have exactly these three keys:\n"
+        '  {"indication": "<copy the indication text exactly>", '
+        '"id": "<EFO_XXXXXXX or MONDO_XXXXXXX or HP_XXXXXXX — use underscore not colon>", '
+        '"name": "<official OpenTargets disease name>"}\n'
+        "- Use JSON null (not the string \"null\") when no match is found.\n"
+        "- Do NOT add trailing commas. Do NOT add any text before or after the array.\n\n"
+        f"Indications to resolve:\n{numbered}\n\n"
+        "JSON array output:"
     )
 
     def _attempt() -> list[tuple[str, str | None, str | None]]:
         text = gemini_search(prompt)
-        # Strip any accidental markdown fences
-        text = re.sub(r"```(?:json)?|```", "", text).strip()
-        parsed = json.loads(text)
+        log.warning("    Gemini batch raw (first 600 chars):\n%s", text[:600])
+        parsed = _clean_and_parse_json(text)
+        if not parsed:
+            raise ValueError("Empty parse result")
         results = []
         for item in parsed:
             ind  = item.get("indication", "")
             did  = item.get("id") or None
             name = item.get("name") or None
-            if did:
-                did = did.replace(":", "_")
-                # Verify via OT
-                verified_id, verified_name = ot_search_disease(did)
-                if verified_id:
-                    did, name = verified_id, verified_name
-            if not did:
-                did, name = ot_search_disease(ind)
-            results.append((ind, did, name))
+            results.append(_verify_and_enrich(ind, did, name))
         return results
 
-    # Try once, retry once on any failure
     for attempt in range(1, 3):
         try:
             results = _attempt()
-            # Verify we got results for every item in the batch
             if len(results) == len(batch):
                 return results
-            log.warning("Batch attempt %d returned %d/%d results, retrying…",
-                        attempt, len(results), len(batch))
+            log.warning(
+                "Batch attempt %d: got %d/%d results — retrying",
+                attempt, len(results), len(batch)
+            )
         except Exception as exc:
-            log.warning("Batch attempt %d failed (%s), retrying…", attempt, exc)
+            log.warning("Batch attempt %d failed (%s) — retrying", attempt, exc)
         time.sleep(2)
 
-    # Fallback: resolve each item individually
-    log.warning("Falling back to individual resolution for batch: %s", batch)
-    results = []
-    for ind in batch:
-        prompt_single = (
-            f"Search OpenTargets for the disease matching '{ind}'. "
-            f"Return ONLY: {{\"id\": \"<OT ID>\", \"name\": \"<OT name>\"}}"
-        )
-        text = gemini_search(prompt_single)
-        text = re.sub(r"```(?:json)?|```", "", text).strip()
-        did, name = None, None
-        try:
-            obj  = json.loads(text)
-            did  = (obj.get("id") or "").replace(":", "_") or None
-            name = obj.get("name") or None
-        except Exception:
-            did = extract_id_from_text(text, "disease")
-        if did:
-            v_id, v_name = ot_search_disease(did)
-            if v_id:
-                did, name = v_id, v_name
-        if not did:
-            did, name = ot_search_disease(ind)
-        results.append((ind, did, name))
-    return results
+    # Fallback: resolve each indication individually
+    log.warning("Falling back to per-item resolution for: %s", batch)
+    return [_resolve_single_indication(ind) for ind in batch]
 
 
 def resolve_indications(
