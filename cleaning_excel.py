@@ -9,9 +9,11 @@ Excel Processing Script
 4. Deduplicates on (TA - I, trial_id) — each combination must be unique, first occurrence kept.
 5. Fetches trial_id, primary_region, secondary_countries, size, drug_arm_size_n from BigQuery
    and left-joins them onto the processed Excel data on trial_id.
-6. For rows where primary_region, size, or drug_arm_size_n are still missing after the BQ join,
-   uses Gemini with Google Search grounding to fill them in.
-   Trials are batched per FALLBACK_TRIALS_PER_CALL from .env.
+6. For rows where primary_region, size, or drug_arm_size_n are still missing after the BQ join:
+   a. First queries ClinicalTrials.gov REST API (v2) directly for each NCT* trial ID.
+      This is free, requires no API key, and returns reliable structured data.
+   b. Any trial IDs still missing after that (e.g. EudraCT, non-NCT IDs) are sent to Gemini
+      with Google Search grounding as a true last resort.
 
 .env variables required:
     OUTPUT_FILE                    - Path to the input Excel file
@@ -20,7 +22,7 @@ Excel Processing Script
     BQ_DATASET_ID                  - BigQuery dataset ID
     SSTABLE                        - BigQuery table name
     GEMINI_API_KEY                 - Gemini API key
-    FALLBACK_TRIALS_PER_CALL       - Number of trials to look up in a single Gemini call
+    FALLBACK_TRIALS_PER_CALL       - Number of trials to send to Gemini in one call (default: 5)
 
 Usage:
     python process_excel.py
@@ -30,6 +32,8 @@ import json
 import re
 import sys
 import time
+import urllib.request
+import urllib.parse
 from pathlib import Path
 
 import pandas as pd
@@ -37,6 +41,21 @@ from dotenv import load_dotenv
 import os
 
 load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def is_missing(val) -> bool:
+    """Return True if a value is NaN, None, or an empty/whitespace string."""
+    if val is None:
+        return True
+    if isinstance(val, float) and pd.isna(val):
+        return True
+    if isinstance(val, str) and val.strip() == "":
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -87,21 +106,199 @@ def fetch_bq_data(project_id: str, dataset_id: str, table: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Gemini fallback with Google Search grounding
+# Step 6a — ClinicalTrials.gov API (primary fallback, NCT IDs only)
 # ---------------------------------------------------------------------------
 
-def is_missing(val) -> bool:
-    """Return True if a value is NaN, None, or an empty/whitespace string."""
-    if val is None:
-        return True
-    if isinstance(val, float) and pd.isna(val):
-        return True
-    if isinstance(val, str) and val.strip() == "":
-        return True
-    return False
+# Map CT.gov location keys → region labels
+_COUNTRY_TO_REGION = {
+    # North America
+    "United States": "United States",
+    "Canada": "North America",
+    "Mexico": "North America",
+    # Europe
+    "United Kingdom": "Europe",
+    "Germany": "Europe",
+    "France": "Europe",
+    "Italy": "Europe",
+    "Spain": "Europe",
+    "Netherlands": "Europe",
+    "Belgium": "Europe",
+    "Switzerland": "Europe",
+    "Sweden": "Europe",
+    "Norway": "Europe",
+    "Denmark": "Europe",
+    "Finland": "Europe",
+    "Austria": "Europe",
+    "Poland": "Europe",
+    "Czech Republic": "Europe",
+    "Portugal": "Europe",
+    "Greece": "Europe",
+    "Hungary": "Europe",
+    "Romania": "Europe",
+    "Russia": "Europe",
+    "Ukraine": "Europe",
+    "Turkey": "Europe",
+    # Asia-Pacific
+    "China": "Asia-Pacific",
+    "Japan": "Asia-Pacific",
+    "South Korea": "Asia-Pacific",
+    "Australia": "Asia-Pacific",
+    "India": "Asia-Pacific",
+    "Taiwan": "Asia-Pacific",
+    "Singapore": "Asia-Pacific",
+    "Hong Kong": "Asia-Pacific",
+    "New Zealand": "Asia-Pacific",
+    "Thailand": "Asia-Pacific",
+    "Malaysia": "Asia-Pacific",
+    "Indonesia": "Asia-Pacific",
+    "Philippines": "Asia-Pacific",
+    "Vietnam": "Asia-Pacific",
+    # Latin America
+    "Brazil": "Latin America",
+    "Argentina": "Latin America",
+    "Chile": "Latin America",
+    "Colombia": "Latin America",
+    "Peru": "Latin America",
+    # Middle East / Africa
+    "Israel": "Middle East",
+    "Saudi Arabia": "Middle East",
+    "United Arab Emirates": "Middle East",
+    "South Africa": "Africa",
+    "Egypt": "Middle East / Africa",
+}
 
 
-def build_prompt(trial_ids: list[str]) -> str:
+def _infer_region(countries: list[str]) -> str:
+    """
+    Given a list of country strings from ClinicalTrials.gov, return the
+    most appropriate primary_region label.
+    """
+    if not countries:
+        return None
+
+    region_counts: dict[str, int] = {}
+    for c in countries:
+        region = _COUNTRY_TO_REGION.get(c, "Other")
+        region_counts[region] = region_counts.get(region, 0) + 1
+
+    # If a single country covers everything → use country name directly
+    if len(countries) == 1:
+        return _COUNTRY_TO_REGION.get(countries[0], countries[0])
+
+    # If US is in the list and is the only country or the majority → "United States"
+    if "United States" in countries:
+        non_us = [c for c in countries if c != "United States"]
+        if not non_us:
+            return "United States"
+
+    # If all countries map to the same region → that region
+    regions = set(region_counts.keys())
+    if len(regions) == 1:
+        return regions.pop()
+
+    # Multi-region → Global
+    return "Global"
+
+
+def _fetch_one_nct(nct_id: str, retries: int = 3, delay: float = 1.5) -> dict | None:
+    """
+    Query the ClinicalTrials.gov v2 REST API for a single NCT ID.
+    Returns a dict with keys: primary_region, size, drug_arm_size_n  (or None on failure).
+    """
+    base_url = "https://clinicaltrials.gov/api/v2/studies"
+    params = urllib.parse.urlencode({
+        "query.id": nct_id,
+        "fields": "protocolSection.designModule,protocolSection.armsInterventionsModule,protocolSection.contactsLocationsModule",
+        "pageSize": 1,
+    })
+    url = f"{base_url}?{params}"
+
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            break
+        except Exception as e:
+            if attempt == retries:
+                print(f"    CT.gov fetch failed for {nct_id} after {retries} attempts: {e}")
+                return None
+            time.sleep(delay * attempt)
+
+    studies = data.get("studies", [])
+    if not studies:
+        print(f"    CT.gov: no study found for {nct_id}")
+        return None
+
+    study = studies[0]
+    protocol = study.get("protocolSection", {})
+
+    # --- enrollment / size ---
+    design = protocol.get("designModule", {})
+    enrollment_info = design.get("enrollmentInfo", {})
+    size = enrollment_info.get("count")  # integer or None
+
+    # --- drug arm size ---
+    arms_module = protocol.get("armsInterventionsModule", {})
+    arms = arms_module.get("armGroups", [])
+    drug_arm_size = None
+    for arm in arms:
+        arm_type = arm.get("type", "").upper()
+        # EXPERIMENTAL or ACTIVE_COMPARATOR are drug arms; PLACEBO / NO_INTERVENTION are not
+        if arm_type in ("EXPERIMENTAL", "ACTIVE_COMPARATOR"):
+            count = arm.get("count")
+            if count is not None:
+                drug_arm_size = (drug_arm_size or 0) + int(count)
+
+    # --- primary region ---
+    locations_module = protocol.get("contactsLocationsModule", {})
+    locations = locations_module.get("locations", [])
+    countries = list({loc.get("country", "") for loc in locations if loc.get("country")})
+    primary_region = _infer_region(countries)
+
+    return {
+        "primary_region": primary_region,
+        "size": int(size) if size is not None else None,
+        "drug_arm_size_n": int(drug_arm_size) if drug_arm_size is not None else None,
+    }
+
+
+def clinicaltrials_lookup(trial_ids: list[str], rate_limit_delay: float = 0.4) -> dict[str, dict]:
+    """
+    Fetch data from ClinicalTrials.gov for all NCT* trial IDs.
+    Returns mapping: trial_id -> {primary_region, size, drug_arm_size_n}.
+    Non-NCT IDs are silently skipped (handled by Gemini fallback).
+    """
+    nct_ids = [t for t in trial_ids if re.match(r"^NCT\d+", t, re.IGNORECASE)]
+    results: dict[str, dict] = {}
+
+    if not nct_ids:
+        return results
+
+    print(f"  Querying ClinicalTrials.gov for {len(nct_ids)} NCT ID(s) ...")
+    for i, nct_id in enumerate(nct_ids, 1):
+        print(f"    [{i}/{len(nct_ids)}] {nct_id} ...", end=" ", flush=True)
+        result = _fetch_one_nct(nct_id)
+        if result:
+            results[nct_id] = result
+            parts = []
+            for k, v in result.items():
+                parts.append(f"{k}={v}")
+            print(", ".join(parts))
+        else:
+            print("not found")
+        # Polite rate-limiting
+        if i < len(nct_ids):
+            time.sleep(rate_limit_delay)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Step 6b — Gemini fallback with Google Search grounding (non-NCT / still missing)
+# ---------------------------------------------------------------------------
+
+def _build_gemini_prompt(trial_ids: list[str]) -> str:
     trials_list = "\n".join(f"- {t}" for t in trial_ids)
     return f"""You are a clinical trial data expert. Use Google Search to look up each of the following clinical trial IDs and return their details.
 
@@ -119,95 +316,93 @@ Return ONLY a valid JSON array with no explanation, no markdown, no code fences.
   {{"trial_id": "NCT87654321", "primary_region": "Europe", "size": 300, "drug_arm_size_n": null}}
 ]
 
-If a value cannot be found after searching, use null. Do not guess.
+If a value cannot be found after thorough searching, use null. Do not guess.
 """
 
 
-def gemini_lookup(trial_ids: list[str], api_key: str) -> list[dict]:
-    """
-    Call Gemini with Google Search grounding for a batch of trial IDs.
-    Returns a list of dicts with keys: trial_id, primary_region, size, drug_arm_size_n.
-    """
-    import urllib.request
-
+def _gemini_lookup_batch(trial_ids: list[str], api_key: str) -> list[dict]:
+    """Single Gemini API call for a batch of trial IDs."""
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-3.5-flash:generateContent"
+        "gemini-2.5-flash:generateContent"
     )
-
     payload = {
-        "contents": [
-            {
-                "parts": [{"text": build_prompt(trial_ids)}]
-            }
-        ],
+        "contents": [{"parts": [{"text": _build_gemini_prompt(trial_ids)}]}],
         "tools": [{"google_search": {}}],
         "generationConfig": {
             "temperature": 0,
-            # Gemini 3 models use thinkingLevel, not thinkingBudget.
-            # "minimal" is the lowest thinking level available for Gemini 3 Flash,
-            # keeping latency and token usage as low as possible.
-            # Do NOT use thinkingBudget here — mixing the two causes a 400 error.
-            "thinkingConfig": {
-                "thinkingLevel": "minimal"
-            },
+            "thinkingConfig": {"thinkingLevel": "minimal"},
         },
     }
-
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=body,
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": api_key,
-        },
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
         method="POST",
     )
-
     with urllib.request.urlopen(req, timeout=120) as resp:
         raw = json.loads(resp.read().decode("utf-8"))
 
-    # Extract text from the response.
-    # gemini-2.5-flash (thinking model) may return multiple parts — e.g. a
-    # "thought" part followed by the actual text part. Search all parts for
-    # the first one that has a "text" key and is not marked as a thought.
+    # Extract the non-thought text part
     try:
         parts = raw["candidates"][0]["content"]["parts"]
-        text = None
-        for part in parts:
-            if "text" in part and not part.get("thought", False):
-                text = part["text"]
-                break
+        text = next(
+            (p["text"] for p in parts if "text" in p and not p.get("thought", False)),
+            None,
+        )
         if text is None:
-            raise ValueError("No non-thought text part found in response")
+            raise ValueError("No non-thought text part in Gemini response")
     except (KeyError, IndexError, ValueError) as e:
         print(f"  WARNING: Unexpected Gemini response structure: {e}")
-        print(f"  Full raw response:\n{json.dumps(raw, indent=2)}")
         return []
 
-    # Strip any accidental markdown fences
-    text = re.sub(r"```json\s*", "", text)
-    text = re.sub(r"```\s*", "", text)
-    text = text.strip()
-
+    text = re.sub(r"```json\s*|```\s*", "", text).strip()
     try:
         results = json.loads(text)
-        if isinstance(results, list):
-            return results
-        print(f"  WARNING: Gemini returned non-list JSON: {type(results)}")
-        return []
+        return results if isinstance(results, list) else []
     except json.JSONDecodeError as e:
-        print(f"  WARNING: Could not parse Gemini JSON response: {e}")
-        print(f"  Raw text: {text[:500]}")
+        print(f"  WARNING: Could not parse Gemini JSON: {e}\n  Raw: {text[:500]}")
         return []
 
 
-def gemini_fallback_fill(df: pd.DataFrame, api_key: str, batch_size: int) -> pd.DataFrame:
+def gemini_fallback(trial_ids: list[str], api_key: str, batch_size: int) -> dict[str, dict]:
     """
-    For rows where primary_region, size, or drug_arm_size_n are missing,
-    use Gemini (with Google Search grounding) to fill them in.
-    Trials are de-duped before lookup and results applied back to all matching rows.
+    Send trial IDs to Gemini (with Google Search grounding) in batches.
+    Returns mapping: trial_id -> {primary_region, size, drug_arm_size_n}.
+    """
+    if not trial_ids:
+        return {}
+
+    print(f"  Sending {len(trial_ids)} trial(s) to Gemini (batch size {batch_size}) ...")
+    batches = [trial_ids[i: i + batch_size] for i in range(0, len(trial_ids), batch_size)]
+    results: dict[str, dict] = {}
+
+    for i, batch in enumerate(batches, 1):
+        print(f"    Gemini batch {i}/{len(batches)}: {batch}")
+        try:
+            entries = _gemini_lookup_batch(batch, api_key)
+            for entry in entries:
+                tid = str(entry.get("trial_id", "")).strip()
+                if tid:
+                    results[tid] = entry
+        except Exception as e:
+            print(f"  WARNING: Gemini call failed for batch {i}: {e}")
+        if i < len(batches):
+            time.sleep(2)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Combined fallback orchestrator
+# ---------------------------------------------------------------------------
+
+def fill_missing_fields(df: pd.DataFrame, api_key: str, batch_size: int) -> pd.DataFrame:
+    """
+    For rows where primary_region, size, or drug_arm_size_n are missing:
+      1. Query ClinicalTrials.gov for NCT IDs (structured, free, reliable).
+      2. Query Gemini (Google Search grounded) for anything still missing.
     """
     target_cols = ["primary_region", "size", "drug_arm_size_n"]
 
@@ -216,56 +411,76 @@ def gemini_fallback_fill(df: pd.DataFrame, api_key: str, batch_size: int) -> pd.
         if col not in df.columns:
             df[col] = None
 
-    # Find rows with at least one missing target column
-    needs_fill_mask = df[target_cols].apply(lambda col: col.map(is_missing)).any(axis=1)
-    needs_fill_idx  = df.index[needs_fill_mask].tolist()
+    def _needs_fill(row):
+        return any(is_missing(row.get(col)) for col in target_cols)
+
+    needs_fill_mask = df.apply(_needs_fill, axis=1)
+    needs_fill_idx = df.index[needs_fill_mask].tolist()
 
     if not needs_fill_idx:
-        print("Step 6: No rows with missing primary_region / size / drug_arm_size_n. Skipping Gemini fallback.")
+        print("Step 6: No rows with missing fields. Skipping fallback.")
         return df
 
-    # Unique trial IDs that need lookup
     unique_trials = [
-        t for t in df.loc[needs_fill_idx, "trial_id"].dropna().unique().tolist()
-        if str(t).strip().lower() != "nan" and str(t).strip() != ""
+        t for t in df.loc[needs_fill_idx, "trial_id"].dropna().unique()
+        if str(t).strip().lower() not in ("", "nan")
     ]
-    print(f"Step 6: {len(needs_fill_idx)} row(s) have missing fields across {len(unique_trials)} unique trial(s).")
-    print(f"        Querying Gemini in batches of {batch_size} trial(s) ...")
+    print(f"\nStep 6: {len(needs_fill_idx)} row(s) need fallback across {len(unique_trials)} unique trial ID(s).")
 
-    # Batch the unique trial IDs
-    batches = [unique_trials[i : i + batch_size] for i in range(0, len(unique_trials), batch_size)]
-    all_results: dict[str, dict] = {}  # trial_id -> {primary_region, size, drug_arm_size_n}
+    # ---- 6a: ClinicalTrials.gov (NCT IDs) ----
+    ctgov_results = clinicaltrials_lookup(unique_trials)
 
-    for i, batch in enumerate(batches, 1):
-        print(f"  Batch {i}/{len(batches)}: {batch}")
-        try:
-            results = gemini_lookup(batch, api_key)
-            for entry in results:
-                tid = str(entry.get("trial_id", "")).strip()
-                if tid:
-                    all_results[tid] = entry
-        except Exception as e:
-            print(f"  WARNING: Gemini call failed for batch {i}: {e}")
-
-        # Polite delay between batches to avoid rate limits
-        if i < len(batches):
-            time.sleep(2)
-
-    # Apply results back to dataframe — only fill cells that are still missing
-    filled_count = 0
+    # Apply CT.gov results — fill only still-missing cells
+    filled_ctgov = 0
     for idx in needs_fill_idx:
         tid = str(df.at[idx, "trial_id"]).strip()
-        entry = all_results.get(tid)
+        entry = ctgov_results.get(tid)
         if not entry:
             continue
         for col in target_cols:
-            if is_missing(df.at[idx, col]):
-                val = entry.get(col)
-                if val is not None:
-                    df.at[idx, col] = val
-                    filled_count += 1
+            if is_missing(df.at[idx, col]) and entry.get(col) is not None:
+                df.at[idx, col] = entry[col]
+                filled_ctgov += 1
+    print(f"  CT.gov filled {filled_ctgov} cell(s).")
 
-    print(f"Step 6 done: Filled {filled_count} cell(s) via Gemini grounded search.")
+    # ---- 6b: Gemini for still-missing trials ----
+    # Re-evaluate which rows are still missing
+    still_missing_mask = df.apply(_needs_fill, axis=1)
+    still_missing_idx = df.index[still_missing_mask & needs_fill_mask].tolist()
+
+    still_missing_trials = [
+        t for t in df.loc[still_missing_idx, "trial_id"].dropna().unique()
+        if str(t).strip().lower() not in ("", "nan")
+    ]
+
+    if still_missing_trials:
+        print(f"  {len(still_missing_trials)} trial(s) still have missing fields → sending to Gemini ...")
+        gemini_results = gemini_fallback(still_missing_trials, api_key, batch_size)
+
+        filled_gemini = 0
+        for idx in still_missing_idx:
+            tid = str(df.at[idx, "trial_id"]).strip()
+            entry = gemini_results.get(tid)
+            if not entry:
+                continue
+            for col in target_cols:
+                if is_missing(df.at[idx, col]) and entry.get(col) is not None:
+                    df.at[idx, col] = entry[col]
+                    filled_gemini += 1
+        print(f"  Gemini filled {filled_gemini} cell(s).")
+    else:
+        print("  All fields resolved by CT.gov. Gemini not needed.")
+
+    # Final report
+    still_empty = df.loc[needs_fill_idx].apply(_needs_fill, axis=1).sum()
+    if still_empty:
+        missing_ids = df.loc[needs_fill_idx[df.loc[needs_fill_idx].apply(_needs_fill, axis=1).values], "trial_id"].unique()
+        print(f"  WARNING: {still_empty} row(s) still have missing fields after all fallbacks.")
+        print(f"  Affected trial IDs: {list(missing_ids)}")
+    else:
+        print("  All missing fields have been resolved.")
+
+    print(f"Step 6 done.")
     return df
 
 
@@ -292,7 +507,6 @@ def process():
         "BQ_DATASET_ID": dataset_id,
         "SSTABLE": bq_table,
         "GEMINI_API_KEY": gemini_api_key,
-        "FALLBACK_TRIALS_PER_CALL": fallback_batch,
     }.items() if not v]
 
     if missing_vars:
@@ -355,8 +569,7 @@ def process():
             original_count    = len(df)
             df = df[df["_phase_rank"] == df["_max_rank"]]
             df = df.sort_index().drop(columns=["_phase_rank", "_max_rank"])
-            print(f"Step 3 done: {original_count - len(df)} lower-phase duplicate TA - I row(s) removed. "
-                  f"Rows tied at the highest phase were all kept.")
+            print(f"Step 3 done: {original_count - len(df)} lower-phase duplicate TA - I row(s) removed.")
 
         # -------------------------------------------------------------------
         # 4. Deduplicate on (TA - I, trial_id)
@@ -384,21 +597,21 @@ def process():
             df = df.drop(columns=existing)
 
         df = df.merge(bq_df[bq_cols], on="trial_id", how="left")
-        print(f"Step 5 done: BQ columns joined (primary_region, secondary_countries, size, drug_arm_size_n).")
+        print(f"Step 5 done: BQ columns joined.")
 
     # -----------------------------------------------------------------------
-    # 6. Gemini fallback — fill missing primary_region / size / drug_arm_size_n
+    # 6. Fill missing fields: CT.gov first, then Gemini for anything left
     # -----------------------------------------------------------------------
     if "trial_id" not in df.columns:
-        print("WARNING: Column 'trial_id' not found. Skipping Gemini fallback (step 6).")
+        print("WARNING: Column 'trial_id' not found. Skipping fallback (step 6).")
     else:
-        df = gemini_fallback_fill(df, gemini_api_key, batch_size)
+        df = fill_missing_fields(df, gemini_api_key, batch_size)
 
     # -----------------------------------------------------------------------
     # Write output
     # -----------------------------------------------------------------------
     df.to_excel(output_path, index=False)
-    print(f"Output saved: {output_path}")
+    print(f"\nOutput saved: {output_path}")
 
 
 # ---------------------------------------------------------------------------
