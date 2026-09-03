@@ -21,6 +21,16 @@ adds the following derived columns, one function per calculation:
         B_ind                      final normalised indication breadth score
                                    (all three are dataset-level constants
                                     broadcast to every row)
+    12. L_TA                     – logistic transformation of unique therapy_area count
+        B_raw_TA                   raw normalised therapy-area breadth
+        B_TA                       final normalised therapy-area breadth score
+                                   (all three are dataset-level constants
+                                    broadcast to every row)
+    13. B                        – B_ind × B_TA
+        B_raw_TA                   raw normalised therapy-area breadth
+        B_TA                       final normalised therapy-area breadth score
+                                   (all three are dataset-level constants
+                                    broadcast to every row)
 
 Indication-breadth constants
 -----------------------------
@@ -581,67 +591,206 @@ def _b_raw_ind(x: float, l_ind_0: float) -> float:
     """
     Raw normalised indication breadth at x.
 
-      B_raw_ind(x) = (L_ind(x) - L_ind(0)) / (1 - L_ind(0))
+      B_raw_ind(x) = (L_ind(x) * L_ind(0)) / (1 - L_ind(0))
     """
-    return (_l_ind(x) - l_ind_0) / (1.0 - l_ind_0)
+    return (_l_ind(x) * l_ind_0) / (1.0 - l_ind_0)
 
 
 def add_indication_breadth(df: pd.DataFrame) -> pd.DataFrame:
     """
     Add three dataset-level constant columns:
 
-      L_ind     = L_ind(N_eff_ind)
-                  where N_eff_ind = sum of the effective_indications column
+      L_ind     = L_ind(x)
+                  where x = number of unique values in ot_disease_name
 
-      B_raw_ind = B_raw_ind(N_eff_ind)
-                = (L_ind(N_eff_ind) - L_ind(0)) / (1 - L_ind(0))
+      B_raw_ind = B_raw_ind(x)
+                = (L_ind(x) * L_ind(0)) / (1 - L_ind(0))
 
-      B_ind     = min(1, B_raw_ind(N_eff_ind) / B_raw_ind(1))
+      B_ind     = min(1, B_raw_ind(N_eff_ind) / B_raw_ind(15))
+                  where N_eff_ind is read from effective_indications (single
+                  repeated value across all rows)
 
     All three are scalars derived once from the dataset and then broadcast
     identically to every row.
 
-    Requires 'effective_indications' to already exist (step 3).
+    Requires 'effective_indications' and 'ot_disease_name' to already exist.
     """
     if "effective_indications" not in df.columns:
         raise ValueError(
             "'L_ind'/'B_raw_ind'/'B_ind' require 'effective_indications'. "
             "Ensure step 3 (add_effective_indications) has run."
         )
+    if "ot_disease_name" not in df.columns:
+        print(
+            "WARNING: 'ot_disease_name' column not found. "
+            "'L_ind', 'B_raw_ind', 'B_ind' will be set to NaN."
+        )
+        df["L_ind"] = df["B_raw_ind"] = df["B_ind"] = float("nan")
+        return df
 
-    # N_eff_ind: all rows share the same effective_indications value;
-    # read it once from the first row rather than summing across rows.
+    # x = unique disease count; N_eff_ind = single repeated value
+    x         = df["ot_disease_name"].nunique()
     n_eff_ind = df["effective_indications"].iloc[0]
 
-    # Fixed anchor values computed once
-    l_ind_0     = _l_ind(0)             # L_ind(0) — denominator anchor
-    l_ind_n     = _l_ind(n_eff_ind)     # L_ind(N_eff_ind)
-    b_raw_ind_n = _b_raw_ind(n_eff_ind, l_ind_0)  # B_raw_ind(N_eff_ind)
-    b_raw_ind_1 = _b_raw_ind(1.0, l_ind_0)        # B_raw_ind(1) — normaliser
+    # Anchor and derived values
+    l_ind_0      = _l_ind(0)               # L_ind(0)
+    l_ind_x      = _l_ind(x)               # L_ind(x) → stored as L_ind column
+    b_raw_ind_x  = _b_raw_ind(x, l_ind_0)  # B_raw_ind(x) → stored as B_raw_ind column
+    b_raw_ind_n  = _b_raw_ind(n_eff_ind, l_ind_0)  # B_raw_ind(N_eff_ind) — numerator of B_ind
+    b_raw_ind_15 = _b_raw_ind(15, l_ind_0)          # B_raw_ind(15) — normaliser
 
-    # Guard: if B_raw_ind(1) is effectively zero, B_ind cannot be normalised
-    if abs(b_raw_ind_1) < 1e-12:
+    # Guard: if B_raw_ind(15) is effectively zero, B_ind cannot be normalised
+    if abs(b_raw_ind_15) < 1e-12:
         print(
-            "WARNING: B_raw_ind(1) is effectively zero; "
+            "WARNING: B_raw_ind(15) is effectively zero; "
             "'B_ind' will be set to NaN."
         )
         b_ind = float("nan")
     else:
-        b_ind = min(1.0, b_raw_ind_n / b_raw_ind_1)
+        b_ind = min(1.0, b_raw_ind_n / b_raw_ind_15)
 
     # Broadcast constant scalars to every row
-    df["L_ind"]     = l_ind_n
-    df["B_raw_ind"] = b_raw_ind_n
+    df["L_ind"]     = l_ind_x
+    df["B_raw_ind"] = b_raw_ind_x
     df["B_ind"]     = b_ind
 
     print(
         f"  [11] Indication-breadth columns added (dataset-level constants):\n"
-        f"       N_eff_ind    = {n_eff_ind:.4f}\n"
-        f"       L_ind(0)     = {l_ind_0:.6f}\n"
-        f"       L_ind        = {l_ind_n:.6f}\n"
-        f"       B_raw_ind    = {b_raw_ind_n:.6f}\n"
-        f"       B_raw_ind(1) = {b_raw_ind_1:.6f}\n"
-        f"       B_ind        = {b_ind:.6f}"
+        f"       x (unique ot_disease_name) = {x}\n"
+        f"       N_eff_ind                  = {n_eff_ind:.4f}\n"
+        f"       L_ind(0)                   = {l_ind_0:.6f}\n"
+        f"       L_ind  = L_ind(x)          = {l_ind_x:.6f}\n"
+        f"       B_raw_ind = B_raw_ind(x)   = {b_raw_ind_x:.6f}\n"
+        f"       B_raw_ind(N_eff_ind)        = {b_raw_ind_n:.6f}\n"
+        f"       B_raw_ind(15)               = {b_raw_ind_15:.6f}\n"
+        f"       B_ind                       = {b_ind:.6f}"
+    )
+    return df
+
+
+# ===========================================================================
+# 12. L_TA, B_raw_TA, B_TA
+# ===========================================================================
+
+# Logistic-curve constant for therapy-area breadth (inflection point and steepness differ)
+_N0_TA = 3    # inflection point for TA curve (vs 9 for indication curve)
+_A_TA  = 0.9  # steepness for TA curve (vs 0.40 for indication curve)
+
+
+def _l_ta(x: float) -> float:
+    """
+    Logistic transformation of x for the therapy-area curve.
+
+      L_TA(x) = 1 / (1 + exp(-0.9 * (x - 3)))
+    """
+    return 1.0 / (1.0 + math.exp(-_A_TA * (x - _N0_TA)))
+
+
+def _b_raw_ta(x: float, l_ta_0: float) -> float:
+    """
+    Raw normalised therapy-area breadth at x.
+
+      B_raw_TA(x) = (L_TA(x) * L_TA(0)) / (1 - L_TA(0))
+    """
+    return (_l_ta(x) * l_ta_0) / (1.0 - l_ta_0)
+
+
+def add_therapy_area_breadth(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add three dataset-level constant columns:
+
+      L_TA     = L_TA(x)
+                 where x = number of unique values in therapy_area
+
+      B_raw_TA = B_raw_TA(x)
+               = (L_TA(x) * L_TA(0)) / (1 - L_TA(0))
+
+      B_TA     = min(1, B_raw_TA(N_eff_ind) / B_raw_TA(5))
+                 where N_eff_ind is read from effective_indications (single
+                 repeated value across all rows)
+
+    All three are scalars derived once from the dataset and then broadcast
+    identically to every row.
+
+    Requires 'effective_indications' and 'therapy_area' to already exist.
+    """
+    if "effective_indications" not in df.columns:
+        raise ValueError(
+            "'L_TA'/'B_raw_TA'/'B_TA' require 'effective_indications'. "
+            "Ensure step 3 (add_effective_indications) has run."
+        )
+    if "therapy_area" not in df.columns:
+        print(
+            "WARNING: 'therapy_area' column not found. "
+            "'L_TA', 'B_raw_TA', 'B_TA' will be set to NaN."
+        )
+        df["L_TA"] = df["B_raw_TA"] = df["B_TA"] = float("nan")
+        return df
+
+    # x = unique therapy area count; N_eff_ind = single repeated value
+    x         = df["therapy_area"].nunique()
+    n_eff_ind = df["effective_indications"].iloc[0]
+
+    # Anchor and derived values
+    l_ta_0      = _l_ta(0)                # L_TA(0)
+    l_ta_x      = _l_ta(x)               # L_TA(x) → stored as L_TA column
+    b_raw_ta_x  = _b_raw_ta(x, l_ta_0)   # B_raw_TA(x) → stored as B_raw_TA column
+    b_raw_ta_n  = _b_raw_ta(n_eff_ind, l_ta_0)  # B_raw_TA(N_eff_ind) — numerator of B_TA
+    b_raw_ta_5  = _b_raw_ta(5, l_ta_0)           # B_raw_TA(5) — normaliser
+
+    # Guard: if B_raw_TA(5) is effectively zero, B_TA cannot be normalised
+    if abs(b_raw_ta_5) < 1e-12:
+        print(
+            "WARNING: B_raw_TA(5) is effectively zero; "
+            "'B_TA' will be set to NaN."
+        )
+        b_ta = float("nan")
+    else:
+        b_ta = min(1.0, b_raw_ta_n / b_raw_ta_5)
+
+    # Broadcast constant scalars to every row
+    df["L_TA"]     = l_ta_x
+    df["B_raw_TA"] = b_raw_ta_x
+    df["B_TA"]     = b_ta
+
+    print(
+        f"  [12] Therapy-area breadth columns added (dataset-level constants):\n"
+        f"       x (unique therapy_area)    = {x}\n"
+        f"       N_eff_ind                  = {n_eff_ind:.4f}\n"
+        f"       L_TA(0)                    = {l_ta_0:.6f}\n"
+        f"       L_TA   = L_TA(x)           = {l_ta_x:.6f}\n"
+        f"       B_raw_TA = B_raw_TA(x)     = {b_raw_ta_x:.6f}\n"
+        f"       B_raw_TA(N_eff_ind)         = {b_raw_ta_n:.6f}\n"
+        f"       B_raw_TA(5)                 = {b_raw_ta_5:.6f}\n"
+        f"       B_TA                        = {b_ta:.6f}"
+    )
+    return df
+
+
+# ===========================================================================
+# 13. B
+# ===========================================================================
+
+def add_B(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'B'.
+
+      B = B_ind * B_TA
+
+    Requires 'B_ind' and 'B_TA' to already exist (steps 11 and 12).
+    """
+    required = {"B_ind", "B_TA"}
+    missing_cols = required - set(df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"'B' calculation requires {required}. Missing: {missing_cols}. "
+            "Ensure steps 11 and 12 have run."
+        )
+
+    df["B"] = df["B_ind"] * df["B_TA"]
+    print(
+        f"  [13] 'B' added (B_ind × B_TA).  "
+        f"Value: {df['B'].iloc[0]:.6f}"
     )
     return df
 
@@ -682,6 +831,8 @@ def run_calculations(input_path: Path) -> Path:
     df = add_link(df)                            # 9
     df = add_link_ta(df)                         # 10
     df = add_indication_breadth(df)              # 11
+    df = add_therapy_area_breadth(df)            # 12
+    df = add_B(df)                               # 13
 
     # Write output
     output_path = input_path.with_name(input_path.stem + "_calculated.xlsx")
