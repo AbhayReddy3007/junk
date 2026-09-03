@@ -3,8 +3,10 @@ Excel Processing Script
 -----------------------
 1. Cleans the trial_id column by removing parenthetical suffixes like (ABCDEF).
 2. Adds a 'TA - I' column combining therapy_area and ot_disease_name.
-3. Deduplicates TA - I rows, keeping the highest-phase row per combination.
+3. Deduplicates on TA - I by keeping only the highest-phase row(s).
    Phase priority: Approved > 3 > 2 > 1 (fuzzy-matched).
+   If multiple rows share the same TA - I and the same (highest) phase, all are kept.
+4. Deduplicates on (TA - I, trial_id) — each combination must be unique, first occurrence kept.
 
 Input path is read from OUTPUT_FILE in .env.
 Output is saved alongside the input file as <input_stem>_processed.xlsx.
@@ -102,18 +104,18 @@ def process():
     # -----------------------------------------------------------------------
     missing = [c for c in ("therapy_area", "ot_disease_name") if c not in df.columns]
     if missing:
-        print(f"WARNING: Column(s) {missing} not found. Skipping steps 2 & 3.")
+        print(f"WARNING: Column(s) {missing} not found. Skipping steps 2, 3 & 4.")
     else:
         df["TA - I"] = df["therapy_area"].astype(str) + " - " + df["ot_disease_name"].astype(str)
         print("Step 2 done: 'TA - I' column added.")
 
         # -------------------------------------------------------------------
-        # 3. Deduplicate TA - I by keeping highest-phase row(s).
+        # 3. Deduplicate on TA - I by keeping highest-phase row(s).
         #    If multiple rows share the same TA - I AND the same (highest)
         #    phase, all of them are kept.
         # -------------------------------------------------------------------
         if "phase" not in df.columns:
-            print("WARNING: Column 'phase' not found. Skipping deduplication (step 3).")
+            print("WARNING: Column 'phase' not found. Skipping step 3.")
         else:
             df["_phase_rank"] = df["phase"].apply(phase_rank)
 
@@ -132,6 +134,19 @@ def process():
             rows_removed = original_count - len(df)
             print(f"Step 3 done: {rows_removed} lower-phase duplicate TA - I row(s) removed. "
                   f"Rows tied at the highest phase were all kept.")
+
+        # -------------------------------------------------------------------
+        # 4. Deduplicate on (TA - I, trial_id) — each combination must be unique.
+        #    First occurrence is kept.
+        # -------------------------------------------------------------------
+        if "trial_id" not in df.columns:
+            print("WARNING: Column 'trial_id' not found. Skipping step 4.")
+        else:
+            before = len(df)
+            df = df.drop_duplicates(subset=["TA - I", "trial_id"], keep="first")
+            df = df.sort_index()
+            rows_removed = before - len(df)
+            print(f"Step 4 done: {rows_removed} duplicate (TA - I, trial_id) combination(s) removed.")
 
     # -----------------------------------------------------------------------
     # Write output
