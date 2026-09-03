@@ -390,23 +390,44 @@ Use null only if the value genuinely cannot be found after searching. Do not gue
 
 
 def _gemini_lookup_batch(trial_ids, api_key):
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-2.0-flash:generateContent"
-    )
-    payload = {
-        "contents": [{"parts": [{"text": _build_gemini_prompt(trial_ids)}]}],
-        "tools": [{"google_search": {}}],
-        "generationConfig": {"temperature": 0},
-    }
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=body,
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        raw = json.loads(resp.read().decode("utf-8"))
+    # Primary model; fall back to gemini-3.1-flash-lite if this fails.
+    models = ["gemini-3.5-flash", "gemini-3.1-flash-lite"]
+
+    for model_name in models:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model_name}:generateContent"
+        )
+        payload = {
+            "contents": [{"parts": [{"text": _build_gemini_prompt(trial_ids)}]}],
+            "tools": [{"google_search": {}}],
+            "generationConfig": {"temperature": 0},
+        }
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=body,
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+            break  # success — stop trying models
+        except urllib.error.HTTPError as e:
+            print(f"  WARNING: Gemini model {model_name} returned HTTP {e.code}")
+            if model_name == models[-1]:
+                print(f"  WARNING: All Gemini models failed.")
+                return []
+            print(f"  Retrying with next model ...")
+            continue
+        except Exception as e:
+            print(f"  WARNING: Gemini model {model_name} error: {e}")
+            if model_name == models[-1]:
+                return []
+            continue
+    else:
+        # for-loop completed without break — all models failed
+        return []
 
     try:
         parts = raw["candidates"][0]["content"]["parts"]
@@ -463,19 +484,24 @@ def fill_missing_fields(df, api_key, batch_size):
     """
     target_cols = ["primary_region", "size", "drug_arm_size_n"]
 
+    # Ensure clean 0..N-1 integer index for safe df.at[idx, col] access
+    df = df.reset_index(drop=True)
+
     for col in target_cols:
         if col not in df.columns:
             df[col] = None
 
     # Normalize size and drug_arm_size_n columns to object dtype so int assignments
     # from CT.gov/Gemini don't get silently coerced to NaN by a float64 column.
-    # This also prevents pandas from treating newly-written ints as NaN.
     for col in ["size", "drug_arm_size_n"]:
         if col in df.columns:
             df[col] = df[col].astype(object)
 
+    # Also normalize primary_region to object
+    if "primary_region" in df.columns:
+        df["primary_region"] = df["primary_region"].astype(object)
+
     # Normalize trial_id to uppercase in the dataframe so lookups match consistently.
-    # We keep a display column untouched; only the key used for lookup is uppercased.
     df["_trial_id_upper"] = df["trial_id"].astype(str).str.strip().str.upper()
 
     def _needs_fill(row):
@@ -533,6 +559,12 @@ def fill_missing_fields(df, api_key, batch_size):
                 fill_detail.setdefault(col, 0)
                 fill_detail[col] += 1
     print(f"  CT.gov filled {filled_ctgov} cell(s): {fill_detail}")
+
+    # Verify CT.gov fill actually stuck
+    print(f"  Verification after CT.gov fill:")
+    for col in target_cols:
+        still_missing = df[col].apply(is_missing).sum()
+        print(f"    Missing {col:25s}: {still_missing} row(s)")
 
     # ---- 6b: Gemini for anything still missing ----
     # Recompute which trial IDs still have missing fields after CT.gov pass
@@ -710,13 +742,25 @@ def process():
 
         df = df.merge(bq_df, on="trial_id", how="left")
 
+        # Reset index after merge to ensure clean 0..N-1 integer index.
+        # This prevents stale-index issues from prior filter/dedup steps.
+        df = df.reset_index(drop=True)
+
         bq_matched = df["secondary_countries"].notna()
         print("Step 5 done: BQ columns joined.")
         print(f"  Total rows        : {len(df)}")
         print(f"  Matched in BQ     : {bq_matched.sum()}")
         print(f"  Not matched in BQ : {(~bq_matched).sum()}")
         for col in ["primary_region", "size", "drug_arm_size_n"]:
-            print(f"  Missing {col:25s}: {df[col].apply(is_missing).sum()}")
+            n_missing = df[col].apply(is_missing).sum()
+            print(f"  Missing {col:25s}: {n_missing}")
+
+        # Diagnostic: show which trial_ids have missing fields after BQ join
+        print("  Detailed missing fields per trial_id after BQ join:")
+        for col in ["primary_region", "size", "drug_arm_size_n"]:
+            missing_tids = df.loc[df[col].apply(is_missing), "trial_id"].unique()
+            if len(missing_tids) > 0:
+                print(f"    {col}: {len(missing_tids)} unique trial(s) — {list(missing_tids[:10])}{'...' if len(missing_tids) > 10 else ''}")
 
     # 6. Fill all missing fields — processes EVERY row in the dataframe
     if "trial_id" in df.columns:
