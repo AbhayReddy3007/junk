@@ -10,6 +10,14 @@ Excel Processing Script
 6. For rows where primary_region, size, or drug_arm_size_n are still missing:
    a. ClinicalTrials.gov REST API (v2) for each NCT* trial ID.
    b. Gemini with Google Search grounding for anything still missing.
+7. Drops rows where size is still empty after all fallbacks.
+8. Within each (TA - I, phase) group, retains only the row(s) with the
+   highest-priority primary_region per the hierarchy:
+       Tier 1 (highest): United States / US / UK / Europe / EU and full EU country names
+       Tier 2          : Canada, Switzerland, Australia, Japan
+       Tier 3 (lowest) : any other region / country
+9. Within each (TA - I, phase, primary_region) group, retains only the row
+   with the highest size value.
 
 IMPORTANT — definition of 'size':
     size = number of patients in the drug/treatment arm(s) only.
@@ -81,6 +89,73 @@ def phase_rank(phase_value) -> int:
     if m:
         return int(m.group(1))
     return -1
+
+
+# ---------------------------------------------------------------------------
+# Region priority ranking  (Step 8)
+# ---------------------------------------------------------------------------
+
+# Full EU member-state names that should be treated as Tier 1 "EU" entries.
+_EU_COUNTRY_NAMES = {
+    "austria", "belgium", "bulgaria", "croatia", "cyprus", "czech republic",
+    "czechia", "denmark", "estonia", "finland", "france", "germany", "greece",
+    "hungary", "ireland", "italy", "latvia", "lithuania", "luxembourg", "malta",
+    "netherlands", "poland", "portugal", "romania", "slovakia", "slovenia",
+    "spain", "sweden",
+}
+
+# Tier 2 full-name variants (lower-cased for comparison).
+_TIER2_NAMES = {
+    "canada", "switzerland", "australia", "japan",
+}
+
+
+def region_priority(region_val) -> int:
+    """
+    Return a priority tier for a primary_region value.
+
+    Tier 1 (highest, returned as 1):
+        - United States / US / USA / U.S. / U.S.A.
+        - United Kingdom / UK / U.K. / Great Britain / GB
+        - Europe / EU / European Union / E.U.
+        - Any full EU member-state country name (see _EU_COUNTRY_NAMES)
+
+    Tier 2 (returned as 2):
+        - Canada, Switzerland, Australia, Japan
+
+    Tier 3 (lowest, returned as 3):
+        - Anything else (including None / missing)
+
+    Lower integer = higher priority (so we can use min() or sort ascending).
+    """
+    if is_missing(region_val):
+        return 3
+
+    text = str(region_val).strip().lower()
+
+    # ---- Tier 1 checks ----
+    # United States variants
+    if re.search(r"\b(us|usa|united states|u\.s\.a?\.?)\b", text):
+        return 1
+    # United Kingdom variants
+    if re.search(r"\b(uk|u\.k\.|united kingdom|great britain|gb)\b", text):
+        return 1
+    # Europe / EU variants
+    if re.search(r"\b(europe|eu|european union|e\.u\.)\b", text):
+        return 1
+    # Full EU member-state names
+    if text in _EU_COUNTRY_NAMES:
+        return 1
+
+    # ---- Tier 2 checks ----
+    if text in _TIER2_NAMES:
+        return 2
+    # Also catch abbreviated / partial forms for Tier 2 countries
+    if re.search(r"\b(canada|switzerland|australia|japan)\b", text):
+        return 2
+
+    # ---- Tier 3: everything else ----
+    return 3
 
 
 # ---------------------------------------------------------------------------
@@ -772,8 +847,90 @@ def process():
     if "trial_id" in df.columns:
         df = fill_missing_fields(df, gemini_api_key, batch_size)
 
+    # -----------------------------------------------------------------------
+    # 7. Drop rows where size is still empty after all fallbacks
+    # -----------------------------------------------------------------------
+    if "size" in df.columns:
+        before = len(df)
+        df = df[~df["size"].apply(is_missing)].reset_index(drop=True)
+        dropped = before - len(df)
+        print(f"\nStep 7 done: {dropped} row(s) dropped because size is still empty. "
+              f"Remaining rows: {len(df)}")
+    else:
+        print("\nStep 7: 'size' column not found — skipping row drop.")
+
+    # -----------------------------------------------------------------------
+    # 8. Within each (TA - I, phase) group, keep only the row(s) with the
+    #    highest-priority primary_region.
+    #
+    #    Hierarchy (lower number = higher priority):
+    #      Tier 1: United States / US / UK / Europe / EU / any EU member state
+    #      Tier 2: Canada, Switzerland, Australia, Japan
+    #      Tier 3: anything else
+    #
+    #    If ALL rows in a group are Tier 3, all are kept (no drop).
+    # -----------------------------------------------------------------------
+    required_cols_8 = {"TA - I", "phase", "primary_region"}
+    if required_cols_8.issubset(df.columns):
+        before = len(df)
+
+        # Compute per-row priority (1 = best, 3 = lowest)
+        df["_region_priority"] = df["primary_region"].apply(region_priority)
+
+        # Best (minimum) priority tier within each (TA - I, phase) group
+        df["_best_region_priority"] = df.groupby(
+            ["TA - I", "phase"], sort=False
+        )["_region_priority"].transform("min")
+
+        # Keep only rows that match the best tier for their group
+        df = df[df["_region_priority"] == df["_best_region_priority"]].reset_index(drop=True)
+
+        df = df.drop(columns=["_region_priority", "_best_region_priority"])
+        print(f"\nStep 8 done: {before - len(df)} row(s) removed by region-priority filter. "
+              f"Remaining rows: {len(df)}")
+        print("  Region hierarchy applied: "
+              "Tier 1 (US/UK/EU) > Tier 2 (Canada/Switzerland/Australia/Japan) > Tier 3 (other)")
+    else:
+        missing = required_cols_8 - set(df.columns)
+        print(f"\nStep 8 skipped: missing column(s) {missing}.")
+
+    # -----------------------------------------------------------------------
+    # 9. Within each (TA - I, phase, primary_region) group, keep the single
+    #    row with the highest size value.
+    #    If multiple rows share the exact same maximum size, keep the first one
+    #    (preserving original row order).
+    # -----------------------------------------------------------------------
+    required_cols_9 = {"TA - I", "phase", "primary_region", "size"}
+    if required_cols_9.issubset(df.columns):
+        before = len(df)
+
+        # Coerce size to numeric for a reliable max comparison.
+        # Non-numeric / missing values become NaN and are treated as 0 so they
+        # lose against any real number (Step 7 already removed truly-empty rows,
+        # but this guards against any residual edge cases).
+        df["_size_numeric"] = pd.to_numeric(df["size"], errors="coerce").fillna(0)
+
+        df["_max_size"] = df.groupby(
+            ["TA - I", "phase", "primary_region"], sort=False
+        )["_size_numeric"].transform("max")
+
+        # Keep only the row(s) that have the maximum size for their group
+        df = df[df["_size_numeric"] == df["_max_size"]]
+
+        # Among ties (same max size), keep only the first occurrence
+        df = df.drop_duplicates(subset=["TA - I", "phase", "primary_region"], keep="first")
+
+        df = df.drop(columns=["_size_numeric", "_max_size"]).reset_index(drop=True)
+        print(f"\nStep 9 done: {before - len(df)} row(s) removed by max-size filter. "
+              f"Remaining rows: {len(df)}")
+    else:
+        missing = required_cols_9 - set(df.columns)
+        print(f"\nStep 9 skipped: missing column(s) {missing}.")
+
+    # -----------------------------------------------------------------------
     # Clean up pd.NA values (from BQ nullable dtypes) before saving.
     # openpyxl handles np.nan/None correctly but pd.NA can cause issues.
+    # -----------------------------------------------------------------------
     for col in df.columns:
         df[col] = df[col].where(df[col].notna(), other=None)
 
