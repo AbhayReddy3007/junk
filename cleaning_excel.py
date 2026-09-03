@@ -144,11 +144,12 @@ def gemini_lookup(trial_ids: list[str], api_key: str) -> list[dict]:
         "tools": [{"google_search": {}}],
         "generationConfig": {
             "temperature": 0,
-        },
-        # Disable thinking — it consumes output budget and can produce a
-        # response with no text parts at all (only groundingMetadata).
-        "thinkingConfig": {
-            "thinkingBudget": 0
+            # Must be nested inside generationConfig, not top-level.
+            # gemini-2.5-flash-lite doesn't think by default, but being
+            # explicit prevents the model from thinking if that changes.
+            "thinkingConfig": {
+                "thinkingBudget": 0
+            },
         },
     }
 
