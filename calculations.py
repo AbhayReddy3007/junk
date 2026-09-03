@@ -15,10 +15,16 @@ adds the following derived columns, one function per calculation:
     8.  e_i                      – Q_i × maturity_weight
 
 Usage:
-    python calculations.py <path/to/processed.xlsx>
+    python calculations.py
+
+    The input file path is read from the FILE variable in the .env file
+    located in the working directory.
 
 Output:
     <stem>_calculated.xlsx  written alongside the input file.
+
+.env variable required:
+    FILE  - Path to the *_processed.xlsx file produced by excel_processing_script.py
 
 The script identifies the "drug" column automatically, trying these names in
 order: drug_name, drug, compound_name, molecule_name, generic_name.
@@ -26,11 +32,13 @@ If none match, the first column of the file is used as a fallback and a
 warning is printed.
 """
 
+import os
 import re
 import sys
 from pathlib import Path
 
 import pandas as pd
+from dotenv import load_dotenv
 
 
 # ---------------------------------------------------------------------------
@@ -522,12 +530,11 @@ def run_calculations(input_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(
-            "Usage: python calculations.py <path/to/processed.xlsx>\n"
-            "       The file is typically named  *_processed.xlsx  and is produced\n"
-            "       by excel_processing_script.py."
-        )
+    load_dotenv()
+
+    file_path = os.getenv("FILE")
+    if not file_path:
+        print("ERROR: 'FILE' variable not set in .env (or .env not found).")
         sys.exit(1)
 
-    run_calculations(Path(sys.argv[1]))
+    run_calculations(Path(file_path))
