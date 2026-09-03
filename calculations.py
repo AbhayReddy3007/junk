@@ -13,6 +13,9 @@ adds the following derived columns, one function per calculation:
     6.  w_sample                 – sample-size weight from drug_arm_size_n
     7.  Q_i                      – w_geo × w_sample × w_dose
     8.  e_i                      – Q_i × maturity_weight
+    9.  Link                     – 1 - (1 - prior) × (1 - e_i)
+    10. Link_TA                  – average of Link across all rows sharing the
+                                   same therapy_area
 
 Usage:
     python calculations.py
@@ -459,12 +462,90 @@ def add_e_i(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ===========================================================================
+# 9. Link
+# ===========================================================================
+
+def add_link(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'Link'.
+
+      Link = 1 - (1 - prior) × (1 - e_i)
+
+    This is a probabilistic union: it combines prior belief (prior) with
+    trial evidence (e_i) such that either alone can drive Link toward 1,
+    and neither can push it below 0.
+
+    Requires prior and e_i to already exist.
+    """
+    required = {"prior", "e_i"}
+    missing_cols = required - set(df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"'Link' calculation requires {required}. Missing: {missing_cols}. "
+            "Ensure steps 1 and 8 have run."
+        )
+
+    df["Link"] = 1 - (1 - df["prior"]) * (1 - df["e_i"])
+    print(
+        f"  [9] 'Link' added (1 - (1 - prior) × (1 - e_i)).  "
+        f"Range: {df['Link'].min():.4f} – {df['Link'].max():.4f}"
+    )
+    return df
+
+
+# ===========================================================================
+# 10. Link_TA
+# ===========================================================================
+
+def add_link_ta(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'Link_TA'.
+
+      Link_TA = mean of Link across all rows that share the same therapy_area.
+
+    This is a therapy-area-level aggregate broadcast back to every row
+    belonging to that therapy area.
+
+    Requires 'Link' to already exist (add_link first) and 'therapy_area'
+    to be present in the dataframe.
+
+    Rows whose therapy_area is missing are grouped together under a single
+    NaN key; their Link_TA will be the mean of Link for all such rows.
+    """
+    if "Link" not in df.columns:
+        raise ValueError(
+            "'Link_TA' calculation requires 'Link'. "
+            "Ensure step 9 (add_link) has run."
+        )
+    if "therapy_area" not in df.columns:
+        print(
+            "WARNING: 'therapy_area' column not found. "
+            "'Link_TA' will be NaN for all rows."
+        )
+        df["Link_TA"] = float("nan")
+        return df
+
+    ta_mean = (
+        df.groupby("therapy_area", sort=False, dropna=False)["Link"]
+        .mean()
+        .rename("Link_TA")
+    )
+    df = df.join(ta_mean, on="therapy_area")
+
+    print(
+        f"  [10] 'Link_TA' added (mean of Link per therapy_area).  "
+        f"Range: {df['Link_TA'].min():.4f} – {df['Link_TA'].max():.4f}"
+    )
+    return df
+
+
+# ===========================================================================
 # Main pipeline
 # ===========================================================================
 
 def run_calculations(input_path: Path) -> Path:
     """
-    Load the processed Excel file, apply all 8 calculations in order,
+    Load the processed Excel file, apply all 10 calculations in order,
     and write the result to <stem>_calculated.xlsx.
 
     Returns the output path.
@@ -491,6 +572,8 @@ def run_calculations(input_path: Path) -> Path:
     df = add_w_sample(df)                        # 6
     df = add_Q_i(df)                             # 7
     df = add_e_i(df)                             # 8
+    df = add_link(df)                            # 9
+    df = add_link_ta(df)                         # 10
 
     # Write output
     output_path = input_path.with_name(input_path.stem + "_calculated.xlsx")
