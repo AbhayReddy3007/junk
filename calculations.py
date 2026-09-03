@@ -609,8 +609,9 @@ def add_indication_breadth(df: pd.DataFrame) -> pd.DataFrame:
             "Ensure step 3 (add_effective_indications) has run."
         )
 
-    # N_eff_ind: dataset-level total of effective_indications
-    n_eff_ind = df["effective_indications"].sum()
+    # N_eff_ind: all rows share the same effective_indications value;
+    # read it once from the first row rather than summing across rows.
+    n_eff_ind = df["effective_indications"].iloc[0]
 
     # Fixed anchor values computed once
     l_ind_0     = _l_ind(0)             # L_ind(0) — denominator anchor
