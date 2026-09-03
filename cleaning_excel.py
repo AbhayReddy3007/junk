@@ -5,9 +5,9 @@ Excel Processing Script
 2. Adds a 'TA - I' column combining therapy_area and ot_disease_name.
 3. Deduplicates on TA - I by keeping only the highest-phase row(s).
 4. Deduplicates on (TA - I, trial_id).
-5. Fetches trial_id, primary_region, secondary_countries, size, drug_arm_size_n from BigQuery
+5. Fetches trial_id, primary_region, secondary_countries, size, drug_arm_size_n, dosage from BigQuery
    and left-joins them onto the processed Excel data on trial_id.
-6. For rows where primary_region, size, or drug_arm_size_n are still missing:
+6. For rows where primary_region, size, drug_arm_size_n, or dosage are still missing:
    a. ClinicalTrials.gov REST API (v2) for each NCT* trial ID.
    b. Gemini with Google Search grounding for anything still missing.
 7. Drops rows where size is still empty after all fallbacks.
@@ -166,7 +166,7 @@ def fetch_bq_data(project_id, dataset_id, table):
     from google.cloud import bigquery
     client = bigquery.Client(project=project_id)
     query = f"""
-        SELECT trial_id, primary_region, secondary_countries, size, drug_arm_size_n
+        SELECT trial_id, primary_region, secondary_countries, size, drug_arm_size_n, dosage
         FROM `{project_id}.{dataset_id}.{table}`
     """
     print(f"Fetching BQ data from `{project_id}.{dataset_id}.{table}` ...")
@@ -460,10 +460,15 @@ For each trial find:
 
 - drug_arm_size_n: Same value as size (drug/treatment arm patients only, or total enrollment if arm-level unavailable).
 
+- dosage: The dose and regimen of the investigational drug arm (e.g. "10 mg once daily", "200 mg BID",
+  "100 mg/m² IV q3w"). Include the numeric dose, unit, and frequency/route where available.
+  If multiple drug arms exist, list each separated by " | ".
+  Use null only if genuinely not findable.
+
 Return ONLY a valid JSON array, no explanation, no markdown fences:
 [
-  {{"trial_id": "NCT12345678", "primary_region": "United States", "size": 250, "drug_arm_size_n": 250}},
-  {{"trial_id": "NCT87654321", "primary_region": "Europe", "size": 200, "drug_arm_size_n": 200}}
+  {{"trial_id": "NCT12345678", "primary_region": "United States", "size": 250, "drug_arm_size_n": 250, "dosage": "10 mg once daily"}},
+  {{"trial_id": "NCT87654321", "primary_region": "Europe", "size": 200, "drug_arm_size_n": 200, "dosage": "200 mg BID"}}
 ]
 
 Use null only if the value genuinely cannot be found after searching. Do not guess.
@@ -558,12 +563,13 @@ def gemini_fallback(trial_ids, api_key, batch_size):
 
 def fill_missing_fields(df, api_key, batch_size):
     """
-    For EVERY row in the dataframe, fills primary_region, size, and drug_arm_size_n
-    wherever missing. Operates on all rows, not just a pre-filtered subset.
+    For EVERY row in the dataframe, fills primary_region, size, drug_arm_size_n,
+    and dosage wherever missing. Operates on all rows, not just a pre-filtered subset.
     size and drug_arm_size_n both represent the drug-arm patient count (or total
     enrollment as a best-effort fallback when arm-level data is unavailable).
+    dosage is the dose/regimen of the investigational drug arm(s).
     """
-    target_cols = ["primary_region", "size", "drug_arm_size_n"]
+    target_cols = ["primary_region", "size", "drug_arm_size_n", "dosage"]
 
     # Ensure clean 0..N-1 integer index for safe df.at[idx, col] access
     df = df.reset_index(drop=True)
@@ -572,9 +578,9 @@ def fill_missing_fields(df, api_key, batch_size):
         if col not in df.columns:
             df[col] = None
 
-    # Normalize size and drug_arm_size_n columns to object dtype so int assignments
-    # from CT.gov/Gemini don't get silently coerced to NaN by a float64 column.
-    for col in ["size", "drug_arm_size_n"]:
+    # Normalize numeric/string columns to object dtype so assignments from
+    # CT.gov/Gemini don't get silently coerced to NaN by a typed column.
+    for col in ["size", "drug_arm_size_n", "dosage"]:
         if col in df.columns:
             df[col] = df[col].astype(object)
 
@@ -805,12 +811,12 @@ def process():
         bq_df = fetch_bq_data(project_id, dataset_id, bq_table)
         bq_df["trial_id"] = bq_df["trial_id"].astype(str).str.strip()
 
-        bq_cols = ["trial_id", "primary_region", "secondary_countries", "size", "drug_arm_size_n"]
+        bq_cols = ["trial_id", "primary_region", "secondary_countries", "size", "drug_arm_size_n", "dosage"]
 
         # Deduplicate BQ rows per trial_id — prefer rows with the most non-null values
         # to avoid merge-induced NaN from duplicate BQ entries
         bq_df = bq_df[bq_cols].copy()
-        bq_df["_non_null_count"] = bq_df[["primary_region", "secondary_countries", "size", "drug_arm_size_n"]].notna().sum(axis=1)
+        bq_df["_non_null_count"] = bq_df[["primary_region", "secondary_countries", "size", "drug_arm_size_n", "dosage"]].notna().sum(axis=1)
         bq_df = (
             bq_df.sort_values("_non_null_count", ascending=False)
                  .drop_duplicates(subset=["trial_id"], keep="first")
@@ -832,13 +838,13 @@ def process():
         print(f"  Total rows        : {len(df)}")
         print(f"  Matched in BQ     : {bq_matched.sum()}")
         print(f"  Not matched in BQ : {(~bq_matched).sum()}")
-        for col in ["primary_region", "size", "drug_arm_size_n"]:
+        for col in ["primary_region", "size", "drug_arm_size_n", "dosage"]:
             n_missing = df[col].apply(is_missing).sum()
             print(f"  Missing {col:25s}: {n_missing}")
 
         # Diagnostic: show which trial_ids have missing fields after BQ join
         print("  Detailed missing fields per trial_id after BQ join:")
-        for col in ["primary_region", "size", "drug_arm_size_n"]:
+        for col in ["primary_region", "size", "drug_arm_size_n", "dosage"]:
             missing_tids = df.loc[df[col].apply(is_missing), "trial_id"].unique()
             if len(missing_tids) > 0:
                 print(f"    {col}: {len(missing_tids)} unique trial(s) — {list(missing_tids[:10])}{'...' if len(missing_tids) > 10 else ''}")
