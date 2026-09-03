@@ -132,7 +132,7 @@ def gemini_lookup(trial_ids: list[str], api_key: str) -> list[dict]:
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.0-flash:generateContent?key={api_key}"
+        "gemini-2.5-flash:generateContent"
     )
 
     payload = {
@@ -144,7 +144,6 @@ def gemini_lookup(trial_ids: list[str], api_key: str) -> list[dict]:
         "tools": [{"google_search": {}}],
         "generationConfig": {
             "temperature": 0,
-            "responseMimeType": "text/plain",
         },
     }
 
@@ -152,7 +151,10 @@ def gemini_lookup(trial_ids: list[str], api_key: str) -> list[dict]:
     req = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
         method="POST",
     )
 
