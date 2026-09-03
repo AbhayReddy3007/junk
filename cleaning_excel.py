@@ -11,7 +11,7 @@ Excel Processing Script
    and left-joins them onto the processed Excel data on trial_id.
 6. For rows where primary_region, size, or drug_arm_size_n are still missing after the BQ join:
    a. First queries ClinicalTrials.gov REST API (v2) directly for each NCT* trial ID.
-      This is free, requires no API key, and returns reliable structured data.
+      Uses filter.ids (exact match) + browser User-Agent to avoid 403s.
    b. Any trial IDs still missing after that (e.g. EudraCT, non-NCT IDs) are sent to Gemini
       with Google Search grounding as a true last resort.
 
@@ -34,6 +34,7 @@ import sys
 import time
 import urllib.request
 import urllib.parse
+import urllib.error
 from pathlib import Path
 
 import pandas as pd
@@ -109,7 +110,6 @@ def fetch_bq_data(project_id: str, dataset_id: str, table: str) -> pd.DataFrame:
 # Step 6a — ClinicalTrials.gov API (primary fallback, NCT IDs only)
 # ---------------------------------------------------------------------------
 
-# Map CT.gov location keys → region labels
 _COUNTRY_TO_REGION = {
     # North America
     "United States": "United States",
@@ -138,10 +138,13 @@ _COUNTRY_TO_REGION = {
     "Russia": "Europe",
     "Ukraine": "Europe",
     "Turkey": "Europe",
+    "Turkey (Turkiye)": "Europe",
+    "Turkiye": "Europe",
     # Asia-Pacific
     "China": "Asia-Pacific",
     "Japan": "Asia-Pacific",
     "South Korea": "Asia-Pacific",
+    "Korea, Republic of": "Asia-Pacific",
     "Australia": "Asia-Pacific",
     "India": "Asia-Pacific",
     "Taiwan": "Asia-Pacific",
@@ -159,16 +162,34 @@ _COUNTRY_TO_REGION = {
     "Chile": "Latin America",
     "Colombia": "Latin America",
     "Peru": "Latin America",
-    # Middle East / Africa
+    # Middle East
     "Israel": "Middle East",
     "Saudi Arabia": "Middle East",
     "United Arab Emirates": "Middle East",
+    "Qatar": "Middle East",
+    "Kuwait": "Middle East",
+    "Jordan": "Middle East",
+    "Lebanon": "Middle East",
+    "Egypt": "Middle East",
+    # Africa
     "South Africa": "Africa",
-    "Egypt": "Middle East / Africa",
+    "Nigeria": "Africa",
+    "Kenya": "Africa",
+    "Ethiopia": "Africa",
+}
+
+# Browser-like User-Agent — CT.gov returns 403 for Python's default UA
+_CT_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
 }
 
 
-def _infer_region(countries: list[str]) -> str:
+def _infer_region(countries: list) -> str:
     """
     Given a list of country strings from ClinicalTrials.gov, return the
     most appropriate primary_region label.
@@ -176,57 +197,71 @@ def _infer_region(countries: list[str]) -> str:
     if not countries:
         return None
 
-    region_counts: dict[str, int] = {}
+    region_counts = {}
     for c in countries:
         region = _COUNTRY_TO_REGION.get(c, "Other")
         region_counts[region] = region_counts.get(region, 0) + 1
 
-    # If a single country covers everything → use country name directly
     if len(countries) == 1:
         return _COUNTRY_TO_REGION.get(countries[0], countries[0])
 
-    # If US is in the list and is the only country or the majority → "United States"
     if "United States" in countries:
         non_us = [c for c in countries if c != "United States"]
         if not non_us:
             return "United States"
 
-    # If all countries map to the same region → that region
     regions = set(region_counts.keys())
     if len(regions) == 1:
         return regions.pop()
 
-    # Multi-region → Global
     return "Global"
 
 
-def _fetch_one_nct(nct_id: str, retries: int = 3, delay: float = 1.5) -> dict | None:
+def _fetch_one_nct(nct_id: str, retries: int = 4, delay: float = 2.0):
     """
     Query the ClinicalTrials.gov v2 REST API for a single NCT ID.
     Returns a dict with keys: primary_region, size, drug_arm_size_n  (or None on failure).
+
+    IMPORTANT fixes vs prior version:
+    - Uses `filter.ids` (exact NCT ID match), NOT `query.id` (fuzzy text search
+      that silently returns wrong/no results for many valid NCT IDs).
+    - Sends a browser-like User-Agent; CT.gov returns 403 for Python's default UA.
+    - Verifies the returned NCT ID matches the requested one.
+    - Exponential backoff on 429/5xx.
     """
     base_url = "https://clinicaltrials.gov/api/v2/studies"
-    # Request protocolSection + resultsSection (needed for drug_arm_size_n on
-    # completed trials). Field-level filtering can silently drop nested keys,
-    # so fetch whole sections rather than individual sub-fields.
     params = urllib.parse.urlencode({
-        "query.id": nct_id,
-        "fields": "protocolSection,resultsSection",
+        "filter.ids": nct_id,   # <-- exact match, not fuzzy query.id
         "pageSize": 1,
     })
     url = f"{base_url}?{params}"
 
+    data = None
     for attempt in range(1, retries + 1):
         try:
-            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            req = urllib.request.Request(url, headers=_CT_HEADERS)
             with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             break
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504):
+                wait = delay * (2 ** (attempt - 1))
+                print(f"    CT.gov HTTP {e.code} for {nct_id}, retrying in {wait:.0f}s ...")
+                time.sleep(wait)
+                if attempt == retries:
+                    print(f"    CT.gov: gave up on {nct_id} after {retries} attempts.")
+                    return None
+            else:
+                print(f"    CT.gov fetch failed for {nct_id}: HTTP {e.code} {e.reason}")
+                return None
         except Exception as e:
             if attempt == retries:
-                print(f"    CT.gov fetch failed for {nct_id} after {retries} attempts: {e}")
+                print(f"    CT.gov fetch failed for {nct_id}: {e}")
                 return None
             time.sleep(delay * attempt)
+
+    if data is None:
+        return None
 
     studies = data.get("studies", [])
     if not studies:
@@ -236,21 +271,25 @@ def _fetch_one_nct(nct_id: str, retries: int = 3, delay: float = 1.5) -> dict | 
     study = studies[0]
     protocol = study.get("protocolSection", {})
 
+    # Verify returned NCT ID matches (guard against API quirks)
+    returned_nct = (
+        protocol.get("identificationModule", {}).get("nctId", "")
+    )
+    if returned_nct.upper() != nct_id.upper():
+        print(f"    CT.gov ID mismatch for {nct_id} (got {returned_nct}), skipping.")
+        return None
+
     # --- enrollment / size ---
     design = protocol.get("designModule", {})
     enrollment_info = design.get("enrollmentInfo", {})
-    size = enrollment_info.get("count")  # integer or None
+    size = enrollment_info.get("count")
 
     # --- drug arm size ---
-    # CT.gov v2: arm-level participant counts live in resultsSection.participantFlowModule
-    # for completed trials, or are often absent for ongoing ones. We try two sources:
-    #   1. resultsSection.participantFlowModule.groups (completed trials)
-    #   2. armsInterventionsModule.armGroups[].count  (sometimes populated)
+    # Source 1: armsInterventionsModule (sometimes has count per arm)
     arms_module = protocol.get("armsInterventionsModule", {})
     arms = arms_module.get("armGroups", [])
     drug_arm_size = None
 
-    # Source 1: arm-level count field (present on some studies)
     for arm in arms:
         arm_type = arm.get("type", "").upper()
         if arm_type in ("EXPERIMENTAL", "ACTIVE_COMPARATOR"):
@@ -258,17 +297,15 @@ def _fetch_one_nct(nct_id: str, retries: int = 3, delay: float = 1.5) -> dict | 
             if count is not None:
                 drug_arm_size = (drug_arm_size or 0) + int(count)
 
-    # Source 2: resultsSection participantFlowModule (completed trials with results)
+    # Source 2: resultsSection participantFlowModule (completed trials)
     if drug_arm_size is None:
         results_section = study.get("resultsSection", {})
         flow_module = results_section.get("participantFlowModule", {})
         groups = flow_module.get("groups", [])
         for group in groups:
             title = group.get("title", "").lower()
-            # Skip placebo / control arms
             if any(kw in title for kw in ("placebo", "control", "sham", "no treatment", "observation")):
                 continue
-            # Count participants from the first period's milestones
             periods = flow_module.get("periods", [])
             for period in periods:
                 for milestone in period.get("milestones", []):
@@ -295,14 +332,14 @@ def _fetch_one_nct(nct_id: str, retries: int = 3, delay: float = 1.5) -> dict | 
     }
 
 
-def clinicaltrials_lookup(trial_ids: list[str], rate_limit_delay: float = 0.4) -> dict[str, dict]:
+def clinicaltrials_lookup(trial_ids: list, rate_limit_delay: float = 0.5) -> dict:
     """
     Fetch data from ClinicalTrials.gov for all NCT* trial IDs.
     Returns mapping: trial_id -> {primary_region, size, drug_arm_size_n}.
-    Non-NCT IDs are silently skipped (handled by Gemini fallback).
+    Non-NCT IDs are skipped (handled by Gemini fallback).
     """
     nct_ids = [t for t in trial_ids if re.match(r"^NCT\d+", t, re.IGNORECASE)]
-    results: dict[str, dict] = {}
+    results = {}
 
     if not nct_ids:
         return results
@@ -313,13 +350,10 @@ def clinicaltrials_lookup(trial_ids: list[str], rate_limit_delay: float = 0.4) -
         result = _fetch_one_nct(nct_id)
         if result:
             results[nct_id] = result
-            parts = []
-            for k, v in result.items():
-                parts.append(f"{k}={v}")
+            parts = [f"{k}={v}" for k, v in result.items()]
             print(", ".join(parts))
         else:
             print("not found")
-        # Polite rate-limiting
         if i < len(nct_ids):
             time.sleep(rate_limit_delay)
 
@@ -330,7 +364,7 @@ def clinicaltrials_lookup(trial_ids: list[str], rate_limit_delay: float = 0.4) -
 # Step 6b — Gemini fallback with Google Search grounding (non-NCT / still missing)
 # ---------------------------------------------------------------------------
 
-def _build_gemini_prompt(trial_ids: list[str]) -> str:
+def _build_gemini_prompt(trial_ids: list) -> str:
     trials_list = "\n".join(f"- {t}" for t in trial_ids)
     return f"""You are a clinical trial data expert. Use Google Search to look up each of the following clinical trial IDs and return their details.
 
@@ -352,7 +386,7 @@ If a value cannot be found after thorough searching, use null. Do not guess.
 """
 
 
-def _gemini_lookup_batch(trial_ids: list[str], api_key: str) -> list[dict]:
+def _gemini_lookup_batch(trial_ids: list, api_key: str) -> list:
     """Single Gemini API call for a batch of trial IDs."""
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -361,9 +395,7 @@ def _gemini_lookup_batch(trial_ids: list[str], api_key: str) -> list[dict]:
     payload = {
         "contents": [{"parts": [{"text": _build_gemini_prompt(trial_ids)}]}],
         "tools": [{"google_search": {}}],
-        "generationConfig": {
-            "temperature": 0,
-        },
+        "generationConfig": {"temperature": 0},
     }
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -375,7 +407,6 @@ def _gemini_lookup_batch(trial_ids: list[str], api_key: str) -> list[dict]:
     with urllib.request.urlopen(req, timeout=120) as resp:
         raw = json.loads(resp.read().decode("utf-8"))
 
-    # Extract the non-thought text part
     try:
         parts = raw["candidates"][0]["content"]["parts"]
         text = next(
@@ -383,7 +414,7 @@ def _gemini_lookup_batch(trial_ids: list[str], api_key: str) -> list[dict]:
             None,
         )
         if text is None:
-            raise ValueError("No non-thought text part in Gemini response")
+            raise ValueError("No text part in Gemini response")
     except (KeyError, IndexError, ValueError) as e:
         print(f"  WARNING: Unexpected Gemini response structure: {e}")
         return []
@@ -397,7 +428,7 @@ def _gemini_lookup_batch(trial_ids: list[str], api_key: str) -> list[dict]:
         return []
 
 
-def gemini_fallback(trial_ids: list[str], api_key: str, batch_size: int) -> dict[str, dict]:
+def gemini_fallback(trial_ids: list, api_key: str, batch_size: int) -> dict:
     """
     Send trial IDs to Gemini (with Google Search grounding) in batches.
     Returns mapping: trial_id -> {primary_region, size, drug_arm_size_n}.
@@ -407,7 +438,7 @@ def gemini_fallback(trial_ids: list[str], api_key: str, batch_size: int) -> dict
 
     print(f"  Sending {len(trial_ids)} trial(s) to Gemini (batch size {batch_size}) ...")
     batches = [trial_ids[i: i + batch_size] for i in range(0, len(trial_ids), batch_size)]
-    results: dict[str, dict] = {}
+    results = {}
 
     for i, batch in enumerate(batches, 1):
         print(f"    Gemini batch {i}/{len(batches)}: {batch}")
@@ -437,7 +468,6 @@ def fill_missing_fields(df: pd.DataFrame, api_key: str, batch_size: int) -> pd.D
     """
     target_cols = ["primary_region", "size", "drug_arm_size_n"]
 
-    # Ensure columns exist
     for col in target_cols:
         if col not in df.columns:
             df[col] = None
@@ -461,7 +491,6 @@ def fill_missing_fields(df: pd.DataFrame, api_key: str, batch_size: int) -> pd.D
     # ---- 6a: ClinicalTrials.gov (NCT IDs) ----
     ctgov_results = clinicaltrials_lookup(unique_trials)
 
-    # Apply CT.gov results — fill only still-missing cells
     filled_ctgov = 0
     for idx in needs_fill_idx:
         tid = str(df.at[idx, "trial_id"]).strip()
@@ -475,7 +504,6 @@ def fill_missing_fields(df: pd.DataFrame, api_key: str, batch_size: int) -> pd.D
     print(f"  CT.gov filled {filled_ctgov} cell(s).")
 
     # ---- 6b: Gemini for still-missing trials ----
-    # Re-evaluate which rows are still missing
     still_missing_mask = df.apply(_needs_fill, axis=1)
     still_missing_idx = df.index[still_missing_mask & needs_fill_mask].tolist()
 
@@ -502,18 +530,18 @@ def fill_missing_fields(df: pd.DataFrame, api_key: str, batch_size: int) -> pd.D
     else:
         print("  All fields resolved by CT.gov. Gemini not needed.")
 
-    # Final report — re-check which of the originally-missing rows are still empty
+    # ---- Final report (fixed: use boolean mask, not list index) ----
     originally_missing_df = df.loc[needs_fill_idx]
-    final_still_missing_mask = originally_missing_df.apply(_needs_fill, axis=1)
-    still_empty = final_still_missing_mask.sum()
+    final_still_missing = originally_missing_df.apply(_needs_fill, axis=1)
+    still_empty = final_still_missing.sum()
     if still_empty:
-        missing_ids = originally_missing_df.loc[final_still_missing_mask, "trial_id"].unique()
+        missing_ids = originally_missing_df.loc[final_still_missing, "trial_id"].unique()
         print(f"  WARNING: {still_empty} row(s) still have missing fields after all fallbacks.")
         print(f"  Affected trial IDs: {list(missing_ids)}")
     else:
         print("  All missing fields have been resolved.")
 
-    print(f"Step 6 done.")
+    print("Step 6 done.")
     return df
 
 
@@ -522,16 +550,13 @@ def fill_missing_fields(df: pd.DataFrame, api_key: str, batch_size: int) -> pd.D
 # ---------------------------------------------------------------------------
 
 def process():
-    # ------------------------------------------------------------------
-    # Load and validate .env variables
-    # ------------------------------------------------------------------
-    input_file       = os.getenv("OUTPUT_FILE")
-    credentials      = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    project_id       = os.getenv("PROJECT_ID")
-    dataset_id       = os.getenv("BQ_DATASET_ID")
-    bq_table         = os.getenv("SSTABLE")
-    gemini_api_key   = os.getenv("GEMINI_API_KEY")
-    fallback_batch   = os.getenv("FALLBACK_TRIALS_PER_CALL", "5")
+    input_file     = os.getenv("OUTPUT_FILE")
+    credentials    = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    project_id     = os.getenv("PROJECT_ID")
+    dataset_id     = os.getenv("BQ_DATASET_ID")
+    bq_table       = os.getenv("SSTABLE")
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    fallback_batch = os.getenv("FALLBACK_TRIALS_PER_CALL", "5")
 
     missing_vars = [k for k, v in {
         "OUTPUT_FILE": input_file,
@@ -567,9 +592,7 @@ def process():
 
     df = pd.read_excel(input_path)
 
-    # -----------------------------------------------------------------------
     # 1. Clean trial_id
-    # -----------------------------------------------------------------------
     if "trial_id" not in df.columns:
         print("WARNING: Column 'trial_id' not found. Skipping step 1.")
     else:
@@ -581,9 +604,7 @@ def process():
         )
         print("Step 1 done: trial_id cleaned.")
 
-    # -----------------------------------------------------------------------
     # 2. Add 'TA - I' column
-    # -----------------------------------------------------------------------
     missing_cols = [c for c in ("therapy_area", "ot_disease_name") if c not in df.columns]
     if missing_cols:
         print(f"WARNING: Column(s) {missing_cols} not found. Skipping steps 2, 3 & 4.")
@@ -591,9 +612,7 @@ def process():
         df["TA - I"] = df["therapy_area"].astype(str) + " - " + df["ot_disease_name"].astype(str)
         print("Step 2 done: 'TA - I' column added.")
 
-        # -------------------------------------------------------------------
         # 3. Deduplicate on TA - I by keeping highest-phase row(s)
-        # -------------------------------------------------------------------
         if "phase" not in df.columns:
             print("WARNING: Column 'phase' not found. Skipping step 3.")
         else:
@@ -604,9 +623,7 @@ def process():
             df = df.sort_index().drop(columns=["_phase_rank", "_max_rank"])
             print(f"Step 3 done: {original_count - len(df)} lower-phase duplicate TA - I row(s) removed.")
 
-        # -------------------------------------------------------------------
         # 4. Deduplicate on (TA - I, trial_id)
-        # -------------------------------------------------------------------
         if "trial_id" not in df.columns:
             print("WARNING: Column 'trial_id' not found. Skipping step 4.")
         else:
@@ -614,9 +631,7 @@ def process():
             df = df.drop_duplicates(subset=["TA - I", "trial_id"], keep="first").sort_index()
             print(f"Step 4 done: {before - len(df)} duplicate (TA - I, trial_id) combination(s) removed.")
 
-    # -----------------------------------------------------------------------
     # 5. Fetch from BigQuery and left-join on trial_id
-    # -----------------------------------------------------------------------
     if "trial_id" not in df.columns:
         print("WARNING: Column 'trial_id' not found. Skipping BQ join (step 5).")
     else:
@@ -630,26 +645,17 @@ def process():
             df = df.drop(columns=existing)
 
         df = df.merge(bq_df[bq_cols], on="trial_id", how="left")
-        print(f"Step 5 done: BQ columns joined.")
+        print("Step 5 done: BQ columns joined.")
 
-    # -----------------------------------------------------------------------
     # 6. Fill missing fields: CT.gov first, then Gemini for anything left
-    # -----------------------------------------------------------------------
     if "trial_id" not in df.columns:
         print("WARNING: Column 'trial_id' not found. Skipping fallback (step 6).")
     else:
         df = fill_missing_fields(df, gemini_api_key, batch_size)
 
-    # -----------------------------------------------------------------------
-    # Write output
-    # -----------------------------------------------------------------------
     df.to_excel(output_path, index=False)
     print(f"\nOutput saved: {output_path}")
 
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     process()
