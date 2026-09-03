@@ -16,6 +16,24 @@ adds the following derived columns, one function per calculation:
     9.  Link                     – 1 - (1 - prior) × (1 - e_i)
     10. Link_TA                  – average of Link across all rows sharing the
                                    same therapy_area
+    11. L_ind                    – logistic transformation of N_eff_ind
+        B_raw_ind                  raw normalised indication breadth
+        B_ind                      final normalised indication breadth score
+                                   (all three are dataset-level constants
+                                    broadcast to every row)
+
+Indication-breadth constants
+-----------------------------
+    N0   = 9      (inflection point of logistic curve)
+    a    = 0.40   (steepness parameter)
+
+    L_ind(x)      = 1 / (1 + exp(-a * (x - N0)))
+    B_raw_ind(x)  = (L_ind(x) - L_ind(0)) / (1 - L_ind(0))
+    N_eff_ind     = sum of the effective_indications column across all rows
+    B_ind         = min(1, B_raw_ind(N_eff_ind) / B_raw_ind(1))
+
+    All three values are scalars computed once and stored identically in
+    every row of the output.
 
 Usage:
     python calculations.py
@@ -35,6 +53,7 @@ If none match, the first column of the file is used as a fallback and a
 warning is printed.
 """
 
+import math
 import os
 import re
 import sys
@@ -540,12 +559,99 @@ def add_link_ta(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ===========================================================================
+# 11. L_ind, B_raw_ind, B_ind
+# ===========================================================================
+
+# Logistic-curve constants (fixed for the entire model)
+_N0 = 9       # inflection point
+_A  = 0.40    # steepness parameter
+
+
+def _l_ind(x: float) -> float:
+    """
+    Logistic transformation of x.
+
+      L_ind(x) = 1 / (1 + exp(-a * (x - N0)))
+               = 1 / (1 + exp(-0.40 * (x - 9)))
+    """
+    return 1.0 / (1.0 + math.exp(-_A * (x - _N0)))
+
+
+def _b_raw_ind(x: float, l_ind_0: float) -> float:
+    """
+    Raw normalised indication breadth at x.
+
+      B_raw_ind(x) = (L_ind(x) - L_ind(0)) / (1 - L_ind(0))
+    """
+    return (_l_ind(x) - l_ind_0) / (1.0 - l_ind_0)
+
+
+def add_indication_breadth(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add three dataset-level constant columns:
+
+      L_ind     = L_ind(N_eff_ind)
+                  where N_eff_ind = sum of the effective_indications column
+
+      B_raw_ind = B_raw_ind(N_eff_ind)
+                = (L_ind(N_eff_ind) - L_ind(0)) / (1 - L_ind(0))
+
+      B_ind     = min(1, B_raw_ind(N_eff_ind) / B_raw_ind(1))
+
+    All three are scalars derived once from the dataset and then broadcast
+    identically to every row.
+
+    Requires 'effective_indications' to already exist (step 3).
+    """
+    if "effective_indications" not in df.columns:
+        raise ValueError(
+            "'L_ind'/'B_raw_ind'/'B_ind' require 'effective_indications'. "
+            "Ensure step 3 (add_effective_indications) has run."
+        )
+
+    # N_eff_ind: dataset-level total of effective_indications
+    n_eff_ind = df["effective_indications"].sum()
+
+    # Fixed anchor values computed once
+    l_ind_0     = _l_ind(0)             # L_ind(0) — denominator anchor
+    l_ind_n     = _l_ind(n_eff_ind)     # L_ind(N_eff_ind)
+    b_raw_ind_n = _b_raw_ind(n_eff_ind, l_ind_0)  # B_raw_ind(N_eff_ind)
+    b_raw_ind_1 = _b_raw_ind(1.0, l_ind_0)        # B_raw_ind(1) — normaliser
+
+    # Guard: if B_raw_ind(1) is effectively zero, B_ind cannot be normalised
+    if abs(b_raw_ind_1) < 1e-12:
+        print(
+            "WARNING: B_raw_ind(1) is effectively zero; "
+            "'B_ind' will be set to NaN."
+        )
+        b_ind = float("nan")
+    else:
+        b_ind = min(1.0, b_raw_ind_n / b_raw_ind_1)
+
+    # Broadcast constant scalars to every row
+    df["L_ind"]     = l_ind_n
+    df["B_raw_ind"] = b_raw_ind_n
+    df["B_ind"]     = b_ind
+
+    print(
+        f"  [11] Indication-breadth columns added (dataset-level constants):\n"
+        f"       N_eff_ind    = {n_eff_ind:.4f}\n"
+        f"       L_ind(0)     = {l_ind_0:.6f}\n"
+        f"       L_ind        = {l_ind_n:.6f}\n"
+        f"       B_raw_ind    = {b_raw_ind_n:.6f}\n"
+        f"       B_raw_ind(1) = {b_raw_ind_1:.6f}\n"
+        f"       B_ind        = {b_ind:.6f}"
+    )
+    return df
+
+
+# ===========================================================================
 # Main pipeline
 # ===========================================================================
 
 def run_calculations(input_path: Path) -> Path:
     """
-    Load the processed Excel file, apply all 10 calculations in order,
+    Load the processed Excel file, apply all calculations in order,
     and write the result to <stem>_calculated.xlsx.
 
     Returns the output path.
@@ -574,6 +680,7 @@ def run_calculations(input_path: Path) -> Path:
     df = add_e_i(df)                             # 8
     df = add_link(df)                            # 9
     df = add_link_ta(df)                         # 10
+    df = add_indication_breadth(df)              # 11
 
     # Write output
     output_path = input_path.with_name(input_path.stem + "_calculated.xlsx")
