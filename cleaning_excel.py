@@ -161,11 +161,22 @@ def gemini_lookup(trial_ids: list[str], api_key: str) -> list[dict]:
     with urllib.request.urlopen(req, timeout=120) as resp:
         raw = json.loads(resp.read().decode("utf-8"))
 
-    # Extract text from the response
+    # Extract text from the response.
+    # gemini-2.5-flash (thinking model) may return multiple parts — e.g. a
+    # "thought" part followed by the actual text part. Search all parts for
+    # the first one that has a "text" key and is not marked as a thought.
     try:
-        text = raw["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError) as e:
+        parts = raw["candidates"][0]["content"]["parts"]
+        text = None
+        for part in parts:
+            if "text" in part and not part.get("thought", False):
+                text = part["text"]
+                break
+        if text is None:
+            raise ValueError("No non-thought text part found in response")
+    except (KeyError, IndexError, ValueError) as e:
         print(f"  WARNING: Unexpected Gemini response structure: {e}")
+        print(f"  Full raw response:\n{json.dumps(raw, indent=2)}")
         return []
 
     # Strip any accidental markdown fences
