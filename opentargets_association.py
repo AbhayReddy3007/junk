@@ -257,23 +257,21 @@ def ot_association_score(disease_id: str, target_id: str) -> float | None:
     """
     Return the overall association score (0-1) for a specific target+disease pair.
 
-    Strategy: use Bs (target ID list filter) to request only the row for our
-    target ID, avoiding pagination issues with the previous top-N scan approach.
-    Passes datasources explicitly to match Platform UI weights.
+    Queries from the target side: target(ensemblId) → associatedDiseases(Bs: [diseaseId])
+    to match the Platform's target-centric view.
     """
     query = """
-    query AssocScore($diseaseId: String!, $targetIds: [String!]!,
+    query AssocScore($targetId: String!, $diseaseIds: [String!]!,
                      $datasources: [DatasourceSettingsInput!]) {
-      disease(efoId: $diseaseId) {
-        associatedTargets(
-          enableIndirect: false
-          Bs: $targetIds
+      target(ensemblId: $targetId) {
+        associatedDiseases(
+          Bs: $diseaseIds
           datasources: $datasources
           page: { index: 0, size: 1 }
         ) {
           rows {
             score
-            target { id approvedSymbol }
+            disease { id name }
           }
         }
       }
@@ -281,14 +279,14 @@ def ot_association_score(disease_id: str, target_id: str) -> float | None:
     """
     data = _ot_post(
         query,
-        {"diseaseId": disease_id, "targetIds": [target_id],
+        {"targetId": target_id, "diseaseIds": [disease_id],
          "datasources": OT_DATASOURCE_WEIGHTS},
         context=f"score:{target_id}×{disease_id}",
     )
     if data:
         rows = (
-            data.get("disease", {})
-                .get("associatedTargets", {})
+            data.get("target", {})
+                .get("associatedDiseases", {})
                 .get("rows", [])
         )
         if rows:
@@ -717,31 +715,30 @@ def _score_indication(
     """
     Score one indication against all MoA targets.
 
-    Uses disease(efoId) -> associatedTargets with Bs (target ID filter) to fetch
-    the exact score for each target-disease pair in a single targeted API call.
-    This avoids the pagination cut-off of the bulk scan approach: even if a disease
-    has thousands of associated targets, passing Bs=[targetId] returns only that
-    target's row regardless of its rank.
+    Uses target(ensemblId) -> associatedDiseases with Bs (disease ID filter)
+    to fetch the score exactly as the Platform shows it on the target page
+    (Select Targets → search GLP1R / GIPR → see association scores).
+    This matches the target-centric view the Platform displays by default.
     """
     wanted = {tid: (moa, sym) for moa, tid, sym in target_ids if tid}
     if not wanted:
         return ind, None
 
-    # One query per target: Bs filters associatedTargets to just that target ID
-    # We pass datasources explicitly to match Platform UI weights (API defaults differ).
+    # Query from the TARGET side: target(ensemblId) → associatedDiseases
+    # Bs filters to only the specific disease ID.
+    # datasources passed explicitly to match Platform UI weights.
     query = """
-    query TargetDiseaseScore($diseaseId: String!, $targetIds: [String!]!,
+    query TargetDiseaseScore($targetId: String!, $diseaseIds: [String!]!,
                              $datasources: [DatasourceSettingsInput!]) {
-      disease(efoId: $diseaseId) {
-        associatedTargets(
-          enableIndirect: false
-          Bs: $targetIds
+      target(ensemblId: $targetId) {
+        associatedDiseases(
+          Bs: $diseaseIds
           datasources: $datasources
           page: { index: 0, size: 1 }
         ) {
           rows {
             score
-            target { id approvedSymbol }
+            disease { id name }
           }
         }
       }
@@ -754,15 +751,15 @@ def _score_indication(
         for tid, (moa, sym) in wanted.items():
             data = _ot_post(
                 query,
-                {"diseaseId": did, "targetIds": [tid],
+                {"targetId": tid, "diseaseIds": [did],
                  "datasources": OT_DATASOURCE_WEIGHTS},
                 context=f"score:{tid}x{did}",
             )
             score = None
             if data:
                 rows = (
-                    data.get("disease", {})
-                        .get("associatedTargets", {})
+                    data.get("target", {})
+                        .get("associatedDiseases", {})
                         .get("rows", [])
                 )
                 if rows:
