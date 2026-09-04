@@ -224,18 +224,16 @@ def ot_association_score(disease_id: str, target_id: str) -> float | None:
     """
     Return the overall association score (0-1) for a specific target+disease pair.
 
-    Strategy: query disease -> associatedTargets with no server-side ID filter
-    (the filter argument does not exist in the OT v4 schema).
-    We request a large page and scan for our target ID client-side.
-    If not found in page 0, the pair has no scored association.
+    Strategy: use BFilter to request only the row for our target ID,
+    avoiding pagination issues with the previous top-N scan approach.
     """
     query = """
-    query AssocScore($diseaseId: String!) {
+    query AssocScore($diseaseId: String!, $targetId: String!) {
       disease(efoId: $diseaseId) {
         associatedTargets(
           enableIndirect: true
-          page: { index: 0, size: 25 }
-          orderByScore: "score"
+          BFilter: [$targetId]
+          page: { index: 0, size: 1 }
         ) {
           rows {
             score
@@ -247,7 +245,7 @@ def ot_association_score(disease_id: str, target_id: str) -> float | None:
     """
     data = _ot_post(
         query,
-        {"diseaseId": disease_id},
+        {"diseaseId": disease_id, "targetId": target_id},
         context=f"score:{target_id}×{disease_id}",
     )
     if data:
@@ -256,9 +254,8 @@ def ot_association_score(disease_id: str, target_id: str) -> float | None:
                 .get("associatedTargets", {})
                 .get("rows", [])
         )
-        for row in rows:
-            if row.get("target", {}).get("id") == target_id:
-                return float(row["score"])
+        if rows:
+            return float(rows[0]["score"])
     return None
 
 
@@ -562,6 +559,28 @@ def resolve_indications(
 # ── Scoring (parallelised) ─────────────────────────────────────────────────────
 
 
+def normalize_indication(ind: str) -> str:
+    """
+    Produce a canonical form so spelling variants like
+    'Pre-diabetes', 'Prediabetes', 'pre-diabetes', 'Pre Diabetes'
+    all collapse to the same key.
+
+    Steps:
+      1. Strip leading/trailing whitespace
+      2. Collapse internal whitespace
+      3. Lower-case
+      4. Remove hyphens between letters (pre-diabetes -> prediabetes)
+      5. Collapse any resulting double spaces
+    """
+    s = ind.strip()
+    s = re.sub(r"\s+", " ", s)
+    s = s.lower()
+    # Remove hyphens between word characters: "pre-diabetes" -> "prediabetes"
+    s = re.sub(r"(?<=\w)-(?=\w)", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def _fallback_search_terms(ind: str) -> list[str]:
     """
     Generate progressively simpler OT search terms for an indication.
@@ -677,7 +696,7 @@ def _score_indication(
       disease(efoId: $diseaseId) {
         associatedTargets(
           enableIndirect: true
-          Bs: [$targetId]
+          BFilter: [$targetId]
           page: { index: 0, size: 1 }
         ) {
           rows {
@@ -804,7 +823,26 @@ def main():
 
     raw_moa_str = df[moa_col].dropna().iloc[0]
     raw_moas    = [m.strip() for m in raw_moa_str.split(";") if m.strip()]
-    unique_inds = df[ind_col].dropna().unique().tolist()
+
+    # ── Normalize indications ─────────────────────────────────────────────────
+    # Spelling variants like "Pre-diabetes" / "Prediabetes" / "pre-diabetes"
+    # must all resolve to the same OT disease ID and share one score.
+    # We build a mapping:  normalized_key -> first raw string seen
+    # and a reverse map:   raw_string -> normalized_key
+    raw_inds_all  = df[ind_col].dropna().unique().tolist()
+    norm_to_raw: dict[str, str] = {}   # normalized -> representative raw string
+    raw_to_norm: dict[str, str] = {}   # every raw variant -> its normalized key
+    for raw in raw_inds_all:
+        nk = normalize_indication(raw)
+        raw_to_norm[raw] = nk
+        if nk not in norm_to_raw:
+            norm_to_raw[nk] = raw  # keep the first spelling as representative
+
+    unique_inds = list(norm_to_raw.values())  # one representative per group
+
+    if len(unique_inds) < len(raw_inds_all):
+        merged = len(raw_inds_all) - len(unique_inds)
+        log.info("🔗 Merged %d spelling variants into canonical indications", merged)
 
     log.info("🧬 MoAs (%d): %s", len(raw_moas), raw_moas)
     log.info("🦠 Indications (%d): %s", len(unique_inds), unique_inds)
@@ -824,10 +862,20 @@ def main():
     log.info("\n── Step 3: Fetching association scores ───────────────────────────")
     max_scores = compute_max_scores(unique_inds, ind_map, target_map)
 
+    # ── Map results back to every raw indication variant ───────────────────────
+    # Each raw string looks up its normalized representative's result
+    def _lookup_score(raw_ind):
+        rep = norm_to_raw.get(raw_to_norm.get(raw_ind, ""), raw_ind)
+        return max_scores.get(rep)
+
+    def _lookup_ind_map(raw_ind):
+        rep = norm_to_raw.get(raw_to_norm.get(raw_ind, ""), raw_ind)
+        return ind_map.get(rep, (None, None))
+
     # ── Step 4: Write Excel ────────────────────────────────────────────────────
-    df["association_score"]   = df[ind_col].map(max_scores)
-    df["ot_disease_id"]       = df[ind_col].map(lambda x: ind_map.get(x, (None, None))[0])
-    df["ot_disease_name"]     = df[ind_col].map(lambda x: ind_map.get(x, (None, None))[1])
+    df["association_score"]   = df[ind_col].map(_lookup_score)
+    df["ot_disease_id"]       = df[ind_col].map(lambda x: _lookup_ind_map(x)[0])
+    df["ot_disease_name"]     = df[ind_col].map(lambda x: _lookup_ind_map(x)[1])
     df["ot_targets_resolved"] = "; ".join(
         f"{moa}→{sym or tid}"
         for moa, (tid, sym) in target_map.items() if tid
@@ -876,7 +924,11 @@ def main():
         score = max_scores.get(ind)
         did, dname = ind_map.get(ind, (None, None))
         score_str = f"{score:.4f}" if score is not None else "N/A"
-        print(f"  {ind:<45} {score_str:<10}  ({dname or did or 'unresolved'})")
+        # Show merged variants if any
+        variants = [r for r, nk in raw_to_norm.items()
+                    if norm_to_raw[nk] == ind and r != ind]
+        suffix = f"  (also: {', '.join(variants)})" if variants else ""
+        print(f"  {ind:<45} {score_str:<10}  ({dname or did or 'unresolved'}){suffix}")
 
 
 if __name__ == "__main__":
