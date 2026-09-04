@@ -259,14 +259,13 @@ def ot_association_score(disease_id: str, target_id: str) -> float | None:
 
     Queries from the target side: target(ensemblId) → associatedDiseases(Bs: [diseaseId])
     to match the Platform's target-centric view.
+    No explicit datasources — API defaults were aligned with Platform UI in release 26.03.
     """
     query = """
-    query AssocScore($targetId: String!, $diseaseIds: [String!]!,
-                     $datasources: [DatasourceSettingsInput!]) {
+    query AssocScore($targetId: String!, $diseaseIds: [String!]!) {
       target(ensemblId: $targetId) {
         associatedDiseases(
           Bs: $diseaseIds
-          datasources: $datasources
           page: { index: 0, size: 1 }
         ) {
           rows {
@@ -279,8 +278,7 @@ def ot_association_score(disease_id: str, target_id: str) -> float | None:
     """
     data = _ot_post(
         query,
-        {"targetId": target_id, "diseaseIds": [disease_id],
-         "datasources": OT_DATASOURCE_WEIGHTS},
+        {"targetId": target_id, "diseaseIds": [disease_id]},
         context=f"score:{target_id}×{disease_id}",
     )
     if data:
@@ -726,14 +724,12 @@ def _score_indication(
 
     # Query from the TARGET side: target(ensemblId) → associatedDiseases
     # Bs filters to only the specific disease ID.
-    # datasources passed explicitly to match Platform UI weights.
+    # No explicit datasources — API defaults were aligned with Platform UI in release 26.03.
     query = """
-    query TargetDiseaseScore($targetId: String!, $diseaseIds: [String!]!,
-                             $datasources: [DatasourceSettingsInput!]) {
+    query TargetDiseaseScore($targetId: String!, $diseaseIds: [String!]!) {
       target(ensemblId: $targetId) {
         associatedDiseases(
           Bs: $diseaseIds
-          datasources: $datasources
           page: { index: 0, size: 1 }
         ) {
           rows {
@@ -751,8 +747,7 @@ def _score_indication(
         for tid, (moa, sym) in wanted.items():
             data = _ot_post(
                 query,
-                {"targetId": tid, "diseaseIds": [did],
-                 "datasources": OT_DATASOURCE_WEIGHTS},
+                {"targetId": tid, "diseaseIds": [did]},
                 context=f"score:{tid}x{did}",
             )
             score = None
