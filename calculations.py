@@ -27,6 +27,9 @@ adds the following derived columns, one function per calculation:
                                    (all three are dataset-level constants
                                     broadcast to every row)
     13. B                        – B_ind × B_TA
+    14. Overall Coherence        – weighted coherence score across therapy areas
+    15. C                        – 0.1 + 0.9 × (Overall Coherence)^1.75
+    16. Final Score              – 1 + 4 × B × C
         B_raw_TA                   raw normalised therapy-area breadth
         B_TA                       final normalised therapy-area breadth score
                                    (all three are dataset-level constants
@@ -796,6 +799,138 @@ def add_B(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ===========================================================================
+# 14. Overall Coherence
+# ===========================================================================
+
+def add_overall_coherence(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'Overall Coherence'.
+
+      Overall Coherence = ( Σ(Wᵢ × √Lᵢ) / Σ(Wᵢ) )²
+
+    Where the sum is across all unique therapy areas:
+      Wᵢ = count of unique ot_disease_name values within therapy area i
+      Lᵢ = Link_TA of therapy area i (average of Link for that therapy area)
+
+    The result is a single scalar broadcast identically to every row.
+
+    Requires 'Link_TA', 'therapy_area', and 'ot_disease_name' to exist.
+    """
+    required = {"Link_TA", "therapy_area", "ot_disease_name"}
+    missing_cols = required - set(df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"'Overall Coherence' requires {required}. Missing: {missing_cols}. "
+            "Ensure steps 10, and the therapy_area/ot_disease_name columns exist."
+        )
+
+    # Build a per-therapy-area summary table
+    # Wᵢ: unique ot_disease_name count per therapy_area
+    # Lᵢ: Link_TA for that therapy_area (constant within group, take first value)
+    ta_summary = (
+        df.groupby("therapy_area", sort=False)
+        .agg(
+            W=("ot_disease_name", "nunique"),
+            L=("Link_TA", "first")
+        )
+        .reset_index()
+    )
+
+    # Wᵢ × √Lᵢ — guard against negative L values before sqrt
+    ta_summary["W_sqrt_L"] = ta_summary["W"] * ta_summary["L"].clip(lower=0).pow(0.5)
+
+    sum_w_sqrt_l = ta_summary["W_sqrt_L"].sum()
+    sum_w        = ta_summary["W"].sum()
+
+    if sum_w == 0:
+        print("WARNING: Σ(Wᵢ) is zero; 'Overall Coherence' will be NaN.")
+        overall_coherence = float("nan")
+    else:
+        overall_coherence = (sum_w_sqrt_l / sum_w) ** 2
+
+    df["Overall Coherence"] = overall_coherence
+
+    print(
+        f"  [14] 'Overall Coherence' added (dataset-level constant):\n"
+        f"       Therapy areas considered : {len(ta_summary)}\n"
+        f"       Σ(Wᵢ)                   = {sum_w}\n"
+        f"       Σ(Wᵢ × √Lᵢ)            = {sum_w_sqrt_l:.6f}\n"
+        f"       Overall Coherence        = {overall_coherence:.6f}"
+    )
+    return df
+
+
+# ===========================================================================
+# 15. C
+# ===========================================================================
+
+def add_C(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'C'.
+
+      C = 0.1 + 0.9 × (Overall Coherence)^1.75
+
+    A dataset-level constant broadcast identically to every row.
+
+    Requires 'Overall Coherence' to already exist (step 14).
+    """
+    if "Overall Coherence" not in df.columns:
+        raise ValueError(
+            "'C' requires 'Overall Coherence'. "
+            "Ensure step 14 (add_overall_coherence) has run."
+        )
+
+    overall_coherence = df["Overall Coherence"].iloc[0]
+    c = 0.1 + 0.9 * (overall_coherence ** 1.75)
+
+    df["C"] = c
+
+    print(
+        f"  [15] 'C' added (dataset-level constant):\n"
+        f"       Overall Coherence = {overall_coherence:.6f}\n"
+        f"       C = 0.1 + 0.9 × ({overall_coherence:.6f})^1.75 = {c:.6f}"
+    )
+    return df
+
+
+# ===========================================================================
+# 16. Final Score
+# ===========================================================================
+
+def add_final_score(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'Final Score'.
+
+      Final Score = 1 + 4 × B × C
+
+    A dataset-level constant broadcast identically to every row.
+
+    Requires 'B' and 'C' to already exist (steps 13 and 15).
+    """
+    required = {"B", "C"}
+    missing_cols = required - set(df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"'Final Score' requires {required}. Missing: {missing_cols}. "
+            "Ensure steps 13 and 15 have run."
+        )
+
+    b = df["B"].iloc[0]
+    c = df["C"].iloc[0]
+    final_score = 1 + 4 * b * c
+
+    df["Final Score"] = final_score
+
+    print(
+        f"  [16] 'Final Score' added (dataset-level constant):\n"
+        f"       B            = {b:.6f}\n"
+        f"       C            = {c:.6f}\n"
+        f"       Final Score  = 1 + 4 × {b:.6f} × {c:.6f} = {final_score:.6f}"
+    )
+    return df
+
+
+# ===========================================================================
 # Main pipeline
 # ===========================================================================
 
@@ -833,6 +968,9 @@ def run_calculations(input_path: Path) -> Path:
     df = add_indication_breadth(df)              # 11
     df = add_therapy_area_breadth(df)            # 12
     df = add_B(df)                               # 13
+    df = add_overall_coherence(df)               # 14
+    df = add_C(df)                               # 15
+    df = add_final_score(df)                     # 16
 
     # Write output
     output_path = input_path.with_name(input_path.stem + "_calculated.xlsx")
