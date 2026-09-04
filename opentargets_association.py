@@ -720,7 +720,7 @@ def _score_indication(
     """
     wanted = {tid: (moa, sym) for moa, tid, sym in target_ids if tid}
     if not wanted:
-        return ind, None
+        return ind, 0
 
     # Query from the TARGET side: target(ensemblId) → associatedDiseases
     # Bs filters to only the specific disease ID.
@@ -793,8 +793,8 @@ def _score_indication(
             if scores:
                 break  # found a better ID that yields scores
 
-    best = max(scores) if scores else None
-    log.info("  -> Max score for '%s': %s", ind, f"{best:.4f}" if best else "None")
+    best = max(scores) if scores else 0
+    log.info("  -> Max score for '%s': %s", ind, f"{best:.4f}")
     return ind, best
 
 
@@ -802,7 +802,7 @@ def compute_max_scores(
     indications: list[str],
     ind_map: dict[str, tuple[str | None, str | None]],
     target_map: dict[str, tuple[str | None, str | None]],
-) -> dict[str, float | None]:
+) -> dict[str, float]:
     """Fetch association scores for all indications in parallel (WORKERS threads)."""
     target_ids = [
         (moa, tid, sym)
@@ -811,9 +811,9 @@ def compute_max_scores(
     ]
     if not target_ids:
         log.error("No valid targets resolved — cannot score.")
-        return {ind: None for ind in indications}
+        return {ind: 0 for ind in indications}
 
-    max_scores: dict[str, float | None] = {}
+    max_scores: dict[str, float] = {}
     futures = {}
 
     with ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="score") as exe:
@@ -821,7 +821,7 @@ def compute_max_scores(
             disease_id, _ = ind_map.get(ind, (None, None))
             if not disease_id:
                 log.warning("  Skipping '%s' — no disease ID", ind)
-                max_scores[ind] = None
+                max_scores[ind] = 0
                 continue
             log.info("  Queuing '%s' (%s) × %d targets", ind, disease_id, len(target_ids))
             fut = exe.submit(_score_indication, ind, disease_id, target_ids)
@@ -834,7 +834,7 @@ def compute_max_scores(
             except Exception as exc:
                 ind = futures[fut]
                 log.error("Scoring failed for '%s': %s", ind, exc)
-                max_scores[ind] = None
+                max_scores[ind] = 0
 
     return max_scores
 
@@ -944,7 +944,7 @@ def main():
     # ── Summary ────────────────────────────────────────────────────────────────
     n_targets = sum(1 for v in target_map.values() if v[0])
     n_ind     = sum(1 for v in ind_map.values() if v[0])
-    n_scored  = sum(1 for v in max_scores.values() if v is not None)
+    n_scored  = sum(1 for v in max_scores.values() if v > 0)
 
     log.info("\n── Summary ───────────────────────────────────────────────────────")
     log.info("  MoA targets resolved : %d / %d", n_targets, len(raw_moas))
@@ -956,7 +956,7 @@ def main():
     for ind in unique_inds:
         score = max_scores.get(ind)
         did, dname = ind_map.get(ind, (None, None))
-        score_str = f"{score:.4f}" if score is not None else "N/A"
+        score_str = f"{score:.4f}" if score is not None else "0.0000"
         # Show merged variants if any
         variants = [r for r, nk in raw_to_norm.items()
                     if norm_to_raw[nk] == ind and r != ind]
