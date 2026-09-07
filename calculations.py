@@ -6,8 +6,8 @@ adds the following derived columns, one function per calculation:
 
     1.  prior                    – based on association_score
     2.  maturity_weight          – based on phase
-    3.  effective_indications    – drug-level sum of maturity_weight (same value
-        effective_therapy_areas    for both columns)
+    3.  effective_indications    – drug-level sum of maturity_weight
+        effective_therapy_areas  – sum of per-therapy-area mean of maturity_weight
     4.  w_geo                    – geographic weight from primary_region tier
     5.  w_dose                   – dosage-rank weight within (drug, dosage) groups
     6.  w_sample                 – sample-size weight from drug_arm_size_n
@@ -294,30 +294,59 @@ def add_effective_indications(df: pd.DataFrame, drug_col: str) -> pd.DataFrame:
     """
     Add columns 'effective_indications' and 'effective_therapy_areas'.
 
-    Both columns hold the same value: the sum of maturity_weight across ALL
-    rows that share the same drug (drug_col).  This is a drug-level aggregate
-    broadcast back to every row of that drug.
+    effective_indications:
+        Sum of maturity_weight across ALL rows that share the same drug
+        (drug_col). Drug-level aggregate broadcast back to every row of
+        that drug.
 
-    Requires 'maturity_weight' to already exist (add_maturity_weight first).
+    effective_therapy_areas:
+        Sum of the mean maturity_weight across all therapy areas.
+        For each unique therapy_area, the mean of maturity_weight is
+        computed across all rows in that TA. Those per-TA means are then
+        summed to a single dataset-level scalar, broadcast to every row.
+
+        Formula:
+            effective_therapy_areas = sum over each TA of mean(maturity_weight within TA)
+
+    Requires 'maturity_weight' and 'therapy_area' to already exist
+    (add_maturity_weight first).
     """
     if "maturity_weight" not in df.columns:
         raise ValueError("'maturity_weight' column missing — run add_maturity_weight() first.")
     if drug_col not in df.columns:
         raise ValueError(f"Drug column '{drug_col}' not found in dataframe.")
 
+    # --- effective_indications: drug-level sum of maturity_weight ----------
     drug_sum = (
         df.groupby(drug_col, sort=False)["maturity_weight"]
         .sum()
         .rename("_drug_maturity_sum")
     )
     df = df.join(drug_sum, on=drug_col)
-    df["effective_indications"]   = df["_drug_maturity_sum"]
-    df["effective_therapy_areas"] = df["_drug_maturity_sum"]
+    df["effective_indications"] = df["_drug_maturity_sum"]
     df = df.drop(columns=["_drug_maturity_sum"])
 
+    # --- effective_therapy_areas: sum of per-TA mean of maturity_weight ----
+    if "therapy_area" not in df.columns:
+        print(
+            "WARNING: 'therapy_area' column not found. "
+            "'effective_therapy_areas' will be NaN."
+        )
+        df["effective_therapy_areas"] = float("nan")
+    else:
+        eff_ta = (
+            df.groupby("therapy_area", sort=False)["maturity_weight"]
+            .mean()
+            .sum()
+        )
+        df["effective_therapy_areas"] = eff_ta
+
     print(
-        f"  [3] 'effective_indications' and 'effective_therapy_areas' added "
-        f"(drug-level sum of maturity_weight)."
+        f"  [3] 'effective_indications' and 'effective_therapy_areas' added:\n"
+        f"       effective_indications   = {df['effective_indications'].iloc[0]:.4f} "
+        f"(drug-level sum of maturity_weight)\n"
+        f"       effective_therapy_areas = {df['effective_therapy_areas'].iloc[0]:.4f} "
+        f"(sum of per-TA mean of maturity_weight)"
     )
     return df
 
@@ -848,18 +877,18 @@ def add_therapy_area_breadth(df: pd.DataFrame) -> pd.DataFrame:
       B_raw_TA = B_raw_TA(x)
                = (L_TA(x) * L_TA(0)) / (1 - L_TA(0))
 
-      B_TA     = min(1, B_raw_TA(N_eff_ind) / B_raw_TA(5))
-                 where N_eff_ind is read from effective_indications (single
-                 repeated value across all rows)
+      B_TA     = min(1, B_raw_TA(N_eff_ta) / B_raw_TA(5))
+                 where N_eff_ta is read from effective_therapy_areas (single
+                 repeated value — sum of per-TA mean of maturity_weight)
 
     All three are scalars derived once from the dataset and then broadcast
     identically to every row.
 
-    Requires 'effective_indications' and 'therapy_area' to already exist.
+    Requires 'effective_therapy_areas' and 'therapy_area' to already exist.
     """
-    if "effective_indications" not in df.columns:
+    if "effective_therapy_areas" not in df.columns:
         raise ValueError(
-            "'L_TA'/'B_raw_TA'/'B_TA' require 'effective_indications'. "
+            "'L_TA'/'B_raw_TA'/'B_TA' require 'effective_therapy_areas'. "
             "Ensure step 3 (add_effective_indications) has run."
         )
     if "therapy_area" not in df.columns:
@@ -870,16 +899,16 @@ def add_therapy_area_breadth(df: pd.DataFrame) -> pd.DataFrame:
         df["L_TA"] = df["B_raw_TA"] = df["B_TA"] = float("nan")
         return df
 
-    # x = unique therapy area count; N_eff_ind = single repeated value
-    x         = df["therapy_area"].nunique()
-    n_eff_ind = df["effective_indications"].iloc[0]
+    # x = unique therapy area count; N_eff_ta = single repeated value
+    x        = df["therapy_area"].nunique()
+    n_eff_ta = df["effective_therapy_areas"].iloc[0]
 
     # Anchor and derived values
-    l_ta_0      = _l_ta(0)                # L_TA(0)
-    l_ta_x      = _l_ta(x)               # L_TA(x) → stored as L_TA column
-    b_raw_ta_x  = _b_raw_ta(x, l_ta_0)   # B_raw_TA(x) → stored as B_raw_TA column
-    b_raw_ta_n  = _b_raw_ta(n_eff_ind, l_ta_0)  # B_raw_TA(N_eff_ind) — numerator of B_TA
-    b_raw_ta_5  = _b_raw_ta(5, l_ta_0)           # B_raw_TA(5) — normaliser
+    l_ta_0      = _l_ta(0)               # L_TA(0)
+    l_ta_x      = _l_ta(x)              # L_TA(x) → stored as L_TA column
+    b_raw_ta_x  = _b_raw_ta(x, l_ta_0)  # B_raw_TA(x) → stored as B_raw_TA column
+    b_raw_ta_n  = _b_raw_ta(n_eff_ta, l_ta_0)  # B_raw_TA(N_eff_ta) — numerator of B_TA
+    b_raw_ta_5  = _b_raw_ta(5, l_ta_0)          # B_raw_TA(5) — normaliser
 
     # Guard: if B_raw_TA(5) is effectively zero, B_TA cannot be normalised
     if abs(b_raw_ta_5) < 1e-12:
@@ -899,11 +928,11 @@ def add_therapy_area_breadth(df: pd.DataFrame) -> pd.DataFrame:
     print(
         f"  [12] Therapy-area breadth columns added (dataset-level constants):\n"
         f"       x (unique therapy_area)    = {x}\n"
-        f"       N_eff_ind                  = {n_eff_ind:.4f}\n"
+        f"       N_eff_ta                   = {n_eff_ta:.4f}\n"
         f"       L_TA(0)                    = {l_ta_0:.6f}\n"
         f"       L_TA   = L_TA(x)           = {l_ta_x:.6f}\n"
         f"       B_raw_TA = B_raw_TA(x)     = {b_raw_ta_x:.6f}\n"
-        f"       B_raw_TA(N_eff_ind)         = {b_raw_ta_n:.6f}\n"
+        f"       B_raw_TA(N_eff_ta)          = {b_raw_ta_n:.6f}\n"
         f"       B_raw_TA(5)                 = {b_raw_ta_5:.6f}\n"
         f"       B_TA                        = {b_ta:.6f}"
     )
