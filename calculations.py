@@ -12,7 +12,8 @@ adds the following derived columns, one function per calculation:
     5.  w_dose                   – dosage-rank weight within (drug, dosage) groups
     6.  w_sample                 – sample-size weight from drug_arm_size_n
     7.  Q_i                      – w_geo × w_sample × w_dose
-    8.  e_i                      – Q_i × maturity_weight
+    8.  e_i                      – Q_i × e_phase_i
+    8b. e_phase_i                – phase × association bucket lookup
     9.  Link                     – 1 - (1 - prior) × (1 - e_i)
     10. Link_TA                  – average of Link across all rows sharing the
                                    same therapy_area
@@ -34,6 +35,25 @@ adds the following derived columns, one function per calculation:
         B_TA                       final normalised therapy-area breadth score
                                    (all three are dataset-level constants
                                     broadcast to every row)
+
+e_phase_i lookup table
+-----------------------
+    Association bucket is determined by association_score:
+      > 0.40            → Obvious
+      0.10 <= x <= 0.40 → Indirect
+      < 0.10            → Novel
+
+    +-----------+---------+----------+-------+
+    | Phase     | Obvious | Indirect | Novel |
+    +-----------+---------+----------+-------+
+    | Phase 1   |  0.10   |  0.10    |  0.10 |
+    | Phase 2   |  0.40   |  0.35    |  0.30 |
+    | Phase 3   |  0.80   |  0.65    |  0.55 |
+    | Approved  |  1.00   |  1.00    |  1.00 |
+    +-----------+---------+----------+-------+
+
+    Rows where phase is missing or unrecognised receive NaN.
+    Rows where association_score is missing are treated as Novel.
 
 Indication-breadth constants
 -----------------------------
@@ -116,6 +136,13 @@ def _find_drug_column(df: pd.DataFrame) -> str:
 # so that tier assignments are consistent between the two files.
 # ---------------------------------------------------------------------------
 
+_EU_COUNTRY_NAMES = {
+    "austria", "belgium", "bulgaria", "croatia", "cyprus", "czech republic",
+    "czechia", "denmark", "estonia", "finland", "france", "germany", "greece",
+    "hungary", "ireland", "italy", "latvia", "lithuania", "luxembourg", "malta",
+    "netherlands", "poland", "portugal", "romania", "slovakia", "slovenia",
+    "spain", "sweden",
+}
 
 _TIER2_NAMES = {"canada", "switzerland", "australia", "japan"}
 
@@ -136,6 +163,8 @@ def _region_tier(region_val) -> int:
     if re.search(r"\b(uk|u\.k\.|united kingdom|great britain|gb)\b", text):
         return 1
     if re.search(r"\b(europe|eu|european union|e\.u\.)\b", text):
+        return 1
+    if text in _EU_COUNTRY_NAMES:
         return 1
     if text in _TIER2_NAMES:
         return 2
@@ -281,12 +310,9 @@ def add_effective_indications(df: pd.DataFrame, drug_col: str) -> pd.DataFrame:
         .sum()
         .rename("_drug_maturity_sum")
     )
-
-    effective_therapy_area = (df.groupby("therapy_area")["maturity_weight"].mean().sum())
     df = df.join(drug_sum, on=drug_col)
     df["effective_indications"]   = df["_drug_maturity_sum"]
-    n_unique_indications = df["ot_disease_name"].nunique()
-    df["effective_therapy_areas"] = effective_therapy_area
+    df["effective_therapy_areas"] = df["_drug_maturity_sum"]
     df = df.drop(columns=["_drug_maturity_sum"])
 
     print(
@@ -467,22 +493,142 @@ def add_e_i(df: pd.DataFrame) -> pd.DataFrame:
     """
     Add column 'e_i'.
 
-      e_i = Q_i × maturity_weight
+      e_i = Q_i × e_phase_i
 
-    Requires Q_i and maturity_weight to already exist.
+    Requires Q_i and e_phase_i to already exist.
     """
-    required = {"Q_i", "maturity_weight"}
+    required = {"Q_i", "e_phase_i"}
     missing_cols = required - set(df.columns)
     if missing_cols:
         raise ValueError(
             f"'e_i' calculation requires {required}. Missing: {missing_cols}. "
-            "Ensure steps 2 and 7 have run."
+            "Ensure steps 7 and 8b have run."
         )
 
-    df["e_i"] = df["Q_i"] * df["prior"]
+    df["e_i"] = df["Q_i"] * df["e_phase_i"]
     print(
-        f"  [8] 'e_i' added (Q_i × prior).  "
+        f"  [8] 'e_i' added (Q_i × e_phase_i).  "
         f"Range: {df['e_i'].min():.4f} – {df['e_i'].max():.4f}"
+    )
+    return df
+
+
+# ===========================================================================
+# 8b. e_phase_i
+# ===========================================================================
+
+# Lookup table: (phase_bucket, association_bucket) → e_phase_i value
+_E_PHASE_TABLE = {
+    ("phase1",   "obvious"):  0.10,
+    ("phase1",   "indirect"): 0.10,
+    ("phase1",   "novel"):    0.10,
+    ("phase2",   "obvious"):  0.40,
+    ("phase2",   "indirect"): 0.35,
+    ("phase2",   "novel"):    0.30,
+    ("phase3",   "obvious"):  0.80,
+    ("phase3",   "indirect"): 0.65,
+    ("phase3",   "novel"):    0.55,
+    ("approved", "obvious"):  1.00,
+    ("approved", "indirect"): 1.00,
+    ("approved", "novel"):    1.00,
+}
+
+
+def _phase_bucket(val) -> str | None:
+    """
+    Map a phase label to one of the four lookup-table buckets:
+    'phase1', 'phase2', 'phase3', 'approved'.
+    Returns None for missing or unrecognised values.
+    """
+    if _is_missing(val):
+        return None
+    text = str(val).strip().lower()
+    if re.search(r"\b(approved|approv|marketed|market)\b", text):
+        return "approved"
+    # Phase IV / 4 treated as Approved
+    if re.search(r"\biv\b", text) or re.search(r"\b4\b", text):
+        return "approved"
+    if re.search(r"\biii\b", text) or re.search(r"\b3\b", text):
+        return "phase3"
+    if re.search(r"\bii\b", text) or re.search(r"\b2\b", text):
+        return "phase2"
+    if re.search(r"\bi\b", text) or re.search(r"\b1\b", text):
+        return "phase1"
+    return None
+
+
+def _assoc_bucket(val) -> str:
+    """
+    Map an association_score to one of three buckets:
+      > 0.40            → 'obvious'
+      0.10 <= x <= 0.40 → 'indirect'
+      < 0.10 or missing → 'novel'
+    """
+    if _is_missing(val):
+        return "novel"
+    try:
+        score = float(val)
+    except (ValueError, TypeError):
+        return "novel"
+    if score > 0.40:
+        return "obvious"
+    if score >= 0.10:
+        return "indirect"
+    return "novel"
+
+
+def add_e_phase_i(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'e_phase_i'.
+
+    Looks up a fixed evidence weight from the combination of:
+      - phase bucket  : phase1 | phase2 | phase3 | approved
+      - association bucket: obvious (score > 0.40)
+                            indirect (0.10 <= score <= 0.40)
+                            novel    (score < 0.10 or missing)
+
+    Lookup table:
+      +-----------+---------+----------+-------+
+      | Phase     | Obvious | Indirect | Novel |
+      +-----------+---------+----------+-------+
+      | Phase 1   |  0.10   |  0.10    |  0.10 |
+      | Phase 2   |  0.40   |  0.35    |  0.30 |
+      | Phase 3   |  0.80   |  0.65    |  0.55 |
+      | Approved  |  1.00   |  1.00    |  1.00 |
+      +-----------+---------+----------+-------+
+
+    Rows where phase is missing or unrecognised receive NaN.
+    Rows where association_score is missing are treated as 'novel'.
+
+    Requires 'phase' to already exist.
+    'association_score' is optional (missing → treated as novel).
+    """
+    if "phase" not in df.columns:
+        print(
+            "WARNING: 'phase' column not found. "
+            "'e_phase_i' will be NaN for all rows."
+        )
+        df["e_phase_i"] = float("nan")
+        return df
+
+    if "association_score" not in df.columns:
+        print(
+            "WARNING: 'association_score' column not found. "
+            "All rows will be treated as 'novel' for 'e_phase_i'."
+        )
+
+    def _lookup(row):
+        pb = _phase_bucket(row["phase"])
+        ab = _assoc_bucket(row.get("association_score"))
+        if pb is None:
+            return float("nan")
+        return _E_PHASE_TABLE[(pb, ab)]
+
+    df["e_phase_i"] = df.apply(_lookup, axis=1)
+
+    print(
+        f"  [8b] 'e_phase_i' added (phase × association bucket lookup).  "
+        f"Value counts:\n{df['e_phase_i'].value_counts().sort_index().to_string()}"
     )
     return df
 
@@ -588,9 +734,9 @@ def _b_raw_ind(x: float, l_ind_0: float) -> float:
     """
     Raw normalised indication breadth at x.
 
-      B_raw_ind(x) = (L_ind(x) - L_ind(0)) / (1 - L_ind(0))
+      B_raw_ind(x) = (L_ind(x) * L_ind(0)) / (1 - L_ind(0))
     """
-    return (_l_ind(x) - l_ind_0) / (1.0 - l_ind_0)
+    return (_l_ind(x) * l_ind_0) / (1.0 - l_ind_0)
 
 
 def add_indication_breadth(df: pd.DataFrame) -> pd.DataFrame:
@@ -702,8 +848,8 @@ def add_therapy_area_breadth(df: pd.DataFrame) -> pd.DataFrame:
       B_raw_TA = B_raw_TA(x)
                = (L_TA(x) * L_TA(0)) / (1 - L_TA(0))
 
-      B_TA     = min(1, B_raw_TA(N_eff_ta) / B_raw_TA(5))
-                 where N_eff_ta is read from Therapy areas (single
+      B_TA     = min(1, B_raw_TA(N_eff_ind) / B_raw_TA(5))
+                 where N_eff_ind is read from effective_indications (single
                  repeated value across all rows)
 
     All three are scalars derived once from the dataset and then broadcast
@@ -726,14 +872,13 @@ def add_therapy_area_breadth(df: pd.DataFrame) -> pd.DataFrame:
 
     # x = unique therapy area count; N_eff_ind = single repeated value
     x         = df["therapy_area"].nunique()
-    n_eff_ta = df["effective_therapy_areas"].iloc[0]
     n_eff_ind = df["effective_indications"].iloc[0]
 
     # Anchor and derived values
     l_ta_0      = _l_ta(0)                # L_TA(0)
     l_ta_x      = _l_ta(x)               # L_TA(x) → stored as L_TA column
     b_raw_ta_x  = _b_raw_ta(x, l_ta_0)   # B_raw_TA(x) → stored as B_raw_TA column
-    b_raw_ta_n  = _b_raw_ta(n_eff_ta, l_ta_0)  # B_raw_TA(N_eff_ind) — numerator of B_TA
+    b_raw_ta_n  = _b_raw_ta(n_eff_ind, l_ta_0)  # B_raw_TA(N_eff_ind) — numerator of B_TA
     b_raw_ta_5  = _b_raw_ta(5, l_ta_0)           # B_raw_TA(5) — normaliser
 
     # Guard: if B_raw_TA(5) is effectively zero, B_TA cannot be normalised
@@ -758,7 +903,7 @@ def add_therapy_area_breadth(df: pd.DataFrame) -> pd.DataFrame:
         f"       L_TA(0)                    = {l_ta_0:.6f}\n"
         f"       L_TA   = L_TA(x)           = {l_ta_x:.6f}\n"
         f"       B_raw_TA = B_raw_TA(x)     = {b_raw_ta_x:.6f}\n"
-        f"       B_raw_TA(N_eff_ta)         = {b_raw_ta_n:.6f}\n"
+        f"       B_raw_TA(N_eff_ind)         = {b_raw_ta_n:.6f}\n"
         f"       B_raw_TA(5)                 = {b_raw_ta_5:.6f}\n"
         f"       B_TA                        = {b_ta:.6f}"
     )
@@ -957,7 +1102,8 @@ def run_calculations(input_path: Path) -> Path:
     df = add_w_dose(df, drug_col)                # 5
     df = add_w_sample(df)                        # 6
     df = add_Q_i(df)                             # 7
-    df = add_e_i(df)                             # 8
+    df = add_e_phase_i(df)                       # 8b
+    df = add_e_i(df)                             # 8  (depends on e_phase_i)
     df = add_link(df)                            # 9
     df = add_link_ta(df)                         # 10
     df = add_indication_breadth(df)              # 11
