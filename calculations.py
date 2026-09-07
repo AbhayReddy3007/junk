@@ -116,13 +116,6 @@ def _find_drug_column(df: pd.DataFrame) -> str:
 # so that tier assignments are consistent between the two files.
 # ---------------------------------------------------------------------------
 
-_EU_COUNTRY_NAMES = {
-    "austria", "belgium", "bulgaria", "croatia", "cyprus", "czech republic",
-    "czechia", "denmark", "estonia", "finland", "france", "germany", "greece",
-    "hungary", "ireland", "italy", "latvia", "lithuania", "luxembourg", "malta",
-    "netherlands", "poland", "portugal", "romania", "slovakia", "slovenia",
-    "spain", "sweden",
-}
 
 _TIER2_NAMES = {"canada", "switzerland", "australia", "japan"}
 
@@ -143,8 +136,6 @@ def _region_tier(region_val) -> int:
     if re.search(r"\b(uk|u\.k\.|united kingdom|great britain|gb)\b", text):
         return 1
     if re.search(r"\b(europe|eu|european union|e\.u\.)\b", text):
-        return 1
-    if text in _EU_COUNTRY_NAMES:
         return 1
     if text in _TIER2_NAMES:
         return 2
@@ -290,9 +281,12 @@ def add_effective_indications(df: pd.DataFrame, drug_col: str) -> pd.DataFrame:
         .sum()
         .rename("_drug_maturity_sum")
     )
+
+    effective_therapy_area = (df.groupby("therapy_area")["maturity_weight"].mean().sum())
     df = df.join(drug_sum, on=drug_col)
     df["effective_indications"]   = df["_drug_maturity_sum"]
-    df["effective_therapy_areas"] = df["_drug_maturity_sum"]
+    n_unique_indications = df["ot_disease_name"].nunique()
+    df["effective_therapy_areas"] = effective_therapy_area
     df = df.drop(columns=["_drug_maturity_sum"])
 
     print(
@@ -485,9 +479,9 @@ def add_e_i(df: pd.DataFrame) -> pd.DataFrame:
             "Ensure steps 2 and 7 have run."
         )
 
-    df["e_i"] = df["Q_i"] * df["maturity_weight"]
+    df["e_i"] = df["Q_i"] * df["prior"]
     print(
-        f"  [8] 'e_i' added (Q_i × maturity_weight).  "
+        f"  [8] 'e_i' added (Q_i × prior).  "
         f"Range: {df['e_i'].min():.4f} – {df['e_i'].max():.4f}"
     )
     return df
@@ -594,9 +588,9 @@ def _b_raw_ind(x: float, l_ind_0: float) -> float:
     """
     Raw normalised indication breadth at x.
 
-      B_raw_ind(x) = (L_ind(x) * L_ind(0)) / (1 - L_ind(0))
+      B_raw_ind(x) = (L_ind(x) - L_ind(0)) / (1 - L_ind(0))
     """
-    return (_l_ind(x) * l_ind_0) / (1.0 - l_ind_0)
+    return (_l_ind(x) - l_ind_0) / (1.0 - l_ind_0)
 
 
 def add_indication_breadth(df: pd.DataFrame) -> pd.DataFrame:
@@ -708,8 +702,8 @@ def add_therapy_area_breadth(df: pd.DataFrame) -> pd.DataFrame:
       B_raw_TA = B_raw_TA(x)
                = (L_TA(x) * L_TA(0)) / (1 - L_TA(0))
 
-      B_TA     = min(1, B_raw_TA(N_eff_ind) / B_raw_TA(5))
-                 where N_eff_ind is read from effective_indications (single
+      B_TA     = min(1, B_raw_TA(N_eff_ta) / B_raw_TA(5))
+                 where N_eff_ta is read from Therapy areas (single
                  repeated value across all rows)
 
     All three are scalars derived once from the dataset and then broadcast
@@ -732,13 +726,14 @@ def add_therapy_area_breadth(df: pd.DataFrame) -> pd.DataFrame:
 
     # x = unique therapy area count; N_eff_ind = single repeated value
     x         = df["therapy_area"].nunique()
+    n_eff_ta = df["effective_therapy_areas"].iloc[0]
     n_eff_ind = df["effective_indications"].iloc[0]
 
     # Anchor and derived values
     l_ta_0      = _l_ta(0)                # L_TA(0)
     l_ta_x      = _l_ta(x)               # L_TA(x) → stored as L_TA column
     b_raw_ta_x  = _b_raw_ta(x, l_ta_0)   # B_raw_TA(x) → stored as B_raw_TA column
-    b_raw_ta_n  = _b_raw_ta(n_eff_ind, l_ta_0)  # B_raw_TA(N_eff_ind) — numerator of B_TA
+    b_raw_ta_n  = _b_raw_ta(n_eff_ta, l_ta_0)  # B_raw_TA(N_eff_ind) — numerator of B_TA
     b_raw_ta_5  = _b_raw_ta(5, l_ta_0)           # B_raw_TA(5) — normaliser
 
     # Guard: if B_raw_TA(5) is effectively zero, B_TA cannot be normalised
@@ -763,7 +758,7 @@ def add_therapy_area_breadth(df: pd.DataFrame) -> pd.DataFrame:
         f"       L_TA(0)                    = {l_ta_0:.6f}\n"
         f"       L_TA   = L_TA(x)           = {l_ta_x:.6f}\n"
         f"       B_raw_TA = B_raw_TA(x)     = {b_raw_ta_x:.6f}\n"
-        f"       B_raw_TA(N_eff_ind)         = {b_raw_ta_n:.6f}\n"
+        f"       B_raw_TA(N_eff_ta)         = {b_raw_ta_n:.6f}\n"
         f"       B_raw_TA(5)                 = {b_raw_ta_5:.6f}\n"
         f"       B_TA                        = {b_ta:.6f}"
     )
