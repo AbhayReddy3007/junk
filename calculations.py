@@ -63,7 +63,7 @@ Indication-breadth constants
     L_ind(x)      = 1 / (1 + exp(-a * (x - N0)))
     B_raw_ind(x)  = (L_ind(x) - L_ind(0)) / (1 - L_ind(0))
     N_eff_ind     = sum of the effective_indications column across all rows
-    B_ind         = min(1, B_raw_ind(N_eff_ind) / B_raw_ind(1))
+    B_ind         = min(1, B_raw_ind(N_eff_ind) / B_raw_ind(15))
 
     All three values are scalars computed once and stored identically in
     every row of the output.
@@ -763,9 +763,9 @@ def _b_raw_ind(x: float, l_ind_0: float) -> float:
     """
     Raw normalised indication breadth at x.
 
-      B_raw_ind(x) = (L_ind(x) * L_ind(0)) / (1 - L_ind(0))
+      B_raw_ind(x) = (L_ind(x) - L_ind(0)) / (1 - L_ind(0))
     """
-    return (_l_ind(x) * l_ind_0) / (1.0 - l_ind_0)
+    return (_l_ind(x) - l_ind_0) / (1.0 - l_ind_0)
 
 
 def add_indication_breadth(df: pd.DataFrame) -> pd.DataFrame:
@@ -776,7 +776,7 @@ def add_indication_breadth(df: pd.DataFrame) -> pd.DataFrame:
                   where x = number of unique values in ot_disease_name
 
       B_raw_ind = B_raw_ind(x)
-                = (L_ind(x) * L_ind(0)) / (1 - L_ind(0))
+                = (L_ind(x) - L_ind(0)) / (1 - L_ind(0))
 
       B_ind     = min(1, B_raw_ind(N_eff_ind) / B_raw_ind(15))
                   where N_eff_ind is read from effective_indications (single
@@ -805,10 +805,10 @@ def add_indication_breadth(df: pd.DataFrame) -> pd.DataFrame:
     n_eff_ind = df["effective_indications"].iloc[0]
 
     # Anchor and derived values
-    l_ind_0      = _l_ind(0)               # L_ind(0)
-    l_ind_x      = _l_ind(x)               # L_ind(x) → stored as L_ind column
-    b_raw_ind_x  = _b_raw_ind(x, l_ind_0)  # B_raw_ind(x) → stored as B_raw_ind column
-    b_raw_ind_n  = _b_raw_ind(n_eff_ind, l_ind_0)  # B_raw_ind(N_eff_ind) — numerator of B_ind
+    l_ind_0      = _l_ind(0)                        # L_ind(0)
+    l_ind_x      = _l_ind(x)                        # L_ind(x) → stored as L_ind column
+    b_raw_ind_x  = _b_raw_ind(x, l_ind_0)           # B_raw_ind(x) → stored as B_raw_ind column
+    b_raw_ind_n  = _b_raw_ind(n_eff_ind, l_ind_0)   # B_raw_ind(N_eff_ind) — numerator of B_ind
     b_raw_ind_15 = _b_raw_ind(15, l_ind_0)          # B_raw_ind(15) — normaliser
 
     # Guard: if B_raw_ind(15) is effectively zero, B_ind cannot be normalised
@@ -862,9 +862,9 @@ def _b_raw_ta(x: float, l_ta_0: float) -> float:
     """
     Raw normalised therapy-area breadth at x.
 
-      B_raw_TA(x) = (L_TA(x) * L_TA(0)) / (1 - L_TA(0))
+      B_raw_TA(x) = (L_TA(x) - L_TA(0)) / (1 - L_TA(0))
     """
-    return (_l_ta(x) * l_ta_0) / (1.0 - l_ta_0)
+    return (_l_ta(x) - l_ta_0) / (1.0 - l_ta_0)
 
 
 def add_therapy_area_breadth(df: pd.DataFrame) -> pd.DataFrame:
@@ -875,7 +875,7 @@ def add_therapy_area_breadth(df: pd.DataFrame) -> pd.DataFrame:
                  where x = number of unique values in therapy_area
 
       B_raw_TA = B_raw_TA(x)
-               = (L_TA(x) * L_TA(0)) / (1 - L_TA(0))
+               = (L_TA(x) - L_TA(0)) / (1 - L_TA(0))
 
       B_TA     = min(1, B_raw_TA(N_eff_ta) / B_raw_TA(5))
                  where N_eff_ta is read from effective_therapy_areas (single
