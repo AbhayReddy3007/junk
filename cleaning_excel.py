@@ -477,7 +477,7 @@ Use null only if the value genuinely cannot be found after searching. Do not gue
 
 def _gemini_lookup_batch(trial_ids, api_key):
     # Primary model; fall back to gemini-3.1-flash-lite if this fails.
-    models = ["gemini-3.5-flash", "gemini-3.1-flash-lite"]
+    models = ["gemini-2.5-flash", "gemini-3.1-flash-lite"]
 
     for model_name in models:
         url = (
