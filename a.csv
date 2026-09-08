@@ -1,3 +1,130 @@
+(cognito) C:\Users\P90022569\Downloads\LE>python opentargets.py
+09:43:55  INFO      [MainThread]  📂 Reading: C:\Users\P90022569\Downloads\Book3.xlsx
+09:43:55  INFO      [MainThread]  🔍 Filtered to 94 / 94 rows with indication_type='secondary'
+09:43:55  INFO      [MainThread]  🔗 Merged 1 spelling variants into canonical indications
+09:43:55  INFO      [MainThread]  🧬 MoAs (2): ['Gastric Inhibitory Polypeptide Receptor Agonist', 'Glucagon Like Peptide 1 Receptor Agonist']
+09:43:55  INFO      [MainThread]  🦠 Indications (16): ['Cardiovascular Disease', 'Hypertension', 'Dyslipidemia', 'NAFLD', 'CV Risk Reduction', 'NASH', 'Prediabetes', 'Increased Cardiovascular Risk', 'Cardiovascular Risk/Disease', 'MASH', 'Metabolic Associated Liver Disease (Malo)', 'Metabolic Dysfunction-Associated Steatotic Liver Disease (Masld)', 'MACE Reduction', 'Cardiovascular (Cv) Outcomes', 'Psoriatic Arthritis', 'HFpEF']
+09:43:55  INFO      [MainThread]  🔧 Workers: 3  |  Batch size: 3  |  Cache: C:\Users\P90022569\Downloads\Book3_cache.json
+09:43:55  INFO      [MainThread]  📦 Loaded cache from C:\Users\P90022569\Downloads\Book3_cache.json  (moas=2, indications=16)
+09:43:55  INFO      [MainThread]  
+── Step 1: Loading MoA targets from cache ────────────────────────
+09:43:55  INFO      [MainThread]    💾 Cache hit MoA 'Gastric Inhibitory Polypeptide Receptor Agonist' → ENSG00000010310 (GIPR)
+09:43:55  INFO      [MainThread]    💾 Cache hit MoA 'Glucagon Like Peptide 1 Receptor Agonist' → ENSG00000112164 (GLP1R)
+09:43:55  INFO      [MainThread]  
+── Step 2: Loading indications from cache ────────────────────────
+09:43:55  INFO      [MainThread]    💾 Cache hit 'Cardiovascular Disease' → MONDO_0004995 (cardiovascular disorder)
+09:43:55  INFO      [MainThread]    💾 Cache hit 'Hypertension' → HP_0000822 (Hypertension)
+09:43:55  INFO      [MainThread]    💾 Cache hit 'Dyslipidemia' → MONDO_0002525 (inherited lipid metabolism disorder)
+09:43:55  INFO      [MainThread]    💾 Cache hit 'NAFLD' → MONDO_0013209 (metabolic dysfunction-associated steatotic liver disease)
+09:43:55  INFO      [MainThread]    💾 Cache hit 'CV Risk Reduction' → EFO_0007924 (tonsillectomy risk measurement)
+09:43:55  INFO      [MainThread]    💾 Cache hit 'NASH' → MONDO_0007027 (metabolic dysfunction-associated steatohepatitis)
+09:43:55  INFO      [MainThread]    💾 Cache hit 'Prediabetes' → MONDO_0006920 (prediabetes syndrome)
+09:43:55  INFO      [MainThread]    💾 Cache hit 'Increased Cardiovascular Risk' → EFO_0000195 (metabolic syndrome)
+09:43:55  INFO      [MainThread]    💾 Cache hit 'Cardiovascular Risk/Disease' → EFO_0000195 (metabolic syndrome)
+09:43:55  INFO      [MainThread]    💾 Cache hit 'MASH' → MONDO_0007027 (metabolic dysfunction-associated steatohepatitis)
+09:43:55  INFO      [MainThread]    💾 Cache hit 'Metabolic Associated Liver Disease (Malo)' → MONDO_0009556 (malonic aciduria)
+09:43:55  INFO      [MainThread]    💾 Cache hit 'Metabolic Dysfunction-Associated Steatotic Liver Disease (Masld)' → MONDO_0013209 (metabolic dysfunction-associated steatotic liver disease)
+09:43:55  INFO      [MainThread]    💾 Cache hit 'MACE Reduction' → EFO_0020863 (major adverse cardiovascular event measurement)
+09:43:55  INFO      [MainThread]    💾 Cache hit 'Cardiovascular (Cv) Outcomes' → MONDO_0004995 (cardiovascular disorder)
+09:43:55  INFO      [MainThread]    💾 Cache hit 'Psoriatic Arthritis' → MONDO_0011849 (psoriatic arthritis)
+09:43:55  WARNING   [MainThread]    ⚠️  Cache has null ID for 'HFpEF' — querying OT search API
+09:43:56  WARNING   [MainThread]      ↩ Term 'HFpEF' → no match
+09:43:56  WARNING   [MainThread]      ❌ OT search could not resolve 'HFpEF'
+09:43:56  INFO      [MainThread]  
+── Step 3: Fetching association scores ───────────────────────────
+09:43:56  INFO      [MainThread]    Queuing 'Cardiovascular Disease' (MONDO_0004995) × 2 targets
+09:43:56  INFO      [MainThread]    Queuing 'Hypertension' (HP_0000822) × 2 targets
+09:43:56  INFO      [MainThread]    Queuing 'Dyslipidemia' (MONDO_0002525) × 2 targets
+09:43:56  INFO      [MainThread]    Queuing 'NAFLD' (MONDO_0013209) × 2 targets
+09:43:56  INFO      [MainThread]    Queuing 'CV Risk Reduction' (EFO_0007924) × 2 targets
+09:43:56  INFO      [MainThread]    Queuing 'NASH' (MONDO_0007027) × 2 targets
+09:43:56  INFO      [MainThread]    Queuing 'Prediabetes' (MONDO_0006920) × 2 targets
+09:43:56  INFO      [MainThread]    Queuing 'Increased Cardiovascular Risk' (EFO_0000195) × 2 targets
+09:43:56  INFO      [MainThread]    Queuing 'Cardiovascular Risk/Disease' (EFO_0000195) × 2 targets
+09:43:56  INFO      [MainThread]    Queuing 'MASH' (MONDO_0007027) × 2 targets
+09:43:56  INFO      [MainThread]    Queuing 'Metabolic Associated Liver Disease (Malo)' (MONDO_0009556) × 2 targets
+09:43:56  INFO      [MainThread]    Queuing 'Metabolic Dysfunction-Associated Steatotic Liver Disease (Masld)' (MONDO_0013209) × 2 targets
+09:43:56  INFO      [MainThread]    Queuing 'MACE Reduction' (EFO_0020863) × 2 targets
+09:43:56  INFO      [MainThread]    Queuing 'Cardiovascular (Cv) Outcomes' (MONDO_0004995) × 2 targets
+09:43:56  INFO      [MainThread]    Queuing 'Psoriatic Arthritis' (MONDO_0011849) × 2 targets
+09:43:56  WARNING   [MainThread]    Skipping 'HFpEF' — no disease ID
+09:43:56  INFO      [score_1]      GIPR (ENSG00000010310) x 'Hypertension' -> 0.3743
+09:43:56  INFO      [score_2]      GIPR (ENSG00000010310) x 'Dyslipidemia' -> N/A
+09:43:56  INFO      [score_0]      GIPR (ENSG00000010310) x 'Cardiovascular Disease' -> 0.2630
+09:43:57  INFO      [score_1]      GLP1R (ENSG00000112164) x 'Hypertension' -> 0.4832
+09:43:57  INFO      [score_1]    -> Max score for 'Hypertension': 0.4832
+09:43:57  INFO      [score_2]      GLP1R (ENSG00000112164) x 'Dyslipidemia' -> 0.0118
+09:43:57  INFO      [score_0]      GLP1R (ENSG00000112164) x 'Cardiovascular Disease' -> 0.3791
+09:43:57  INFO      [score_2]    -> Max score for 'Dyslipidemia': 0.0118
+09:43:57  INFO      [score_0]    -> Max score for 'Cardiovascular Disease': 0.3791
+09:43:58  INFO      [score_0]      GIPR (ENSG00000010310) x 'NASH' -> 0.0915
+09:43:58  INFO      [score_2]      GIPR (ENSG00000010310) x 'CV Risk Reduction' -> N/A
+09:43:58  INFO      [score_1]      GIPR (ENSG00000010310) x 'NAFLD' -> 0.0990
+09:43:58  INFO      [score_0]      GLP1R (ENSG00000112164) x 'NASH' -> 0.4140
+09:43:58  INFO      [score_2]      GLP1R (ENSG00000112164) x 'CV Risk Reduction' -> N/A
+09:43:58  WARNING   [score_2]    No scores for 'CV Risk Reduction' with EFO_0007924 — trying fallback disease search
+09:43:58  INFO      [score_1]      GLP1R (ENSG00000112164) x 'NAFLD' -> 0.5345
+09:43:58  INFO      [score_1]    -> Max score for 'NAFLD': 0.5345
+09:43:58  INFO      [score_0]    -> Max score for 'NASH': 0.4140
+09:43:59  WARNING   [score_2]    Fallback term 'CV Risk Reduction' → no OT match
+09:43:59  INFO      [score_1]      GIPR (ENSG00000010310) x 'Prediabetes' -> 0.0031
+09:43:59  INFO      [score_0]      GIPR (ENSG00000010310) x 'Increased Cardiovascular Risk' -> 0.1138
+09:43:59  INFO      [score_2]    OT disease search 'CV Risk' → picked EFO_0007924 (tonsillectomy risk measurement); other hits: [('MONDO_0006594', 'pemphigus'), ('MONDO_0019171', 'familial long QT syndrome')]
+09:43:59  INFO      [score_2]    Fallback term 'CV Risk' → same ID EFO_0007924 already tried, skipping
+09:43:59  INFO      [score_0]      GLP1R (ENSG00000112164) x 'Increased Cardiovascular Risk' -> 0.2314
+09:44:00  INFO      [score_0]    -> Max score for 'Increased Cardiovascular Risk': 0.2314
+09:43:59  INFO      [score_1]      GLP1R (ENSG00000112164) x 'Prediabetes' -> 0.3851
+09:44:00  INFO      [score_1]    -> Max score for 'Prediabetes': 0.3851
+09:44:00  INFO      [score_1]      GIPR (ENSG00000010310) x 'MASH' -> 0.0915
+09:44:00  INFO      [score_2]    OT disease search 'CV' → picked MONDO_0011057 (cerebrovascular disorder); other hits: [('MONDO_0015517', 'common variable immunodeficiency'), ('MONDO_0005098', 'stroke disorder')]
+09:44:00  INFO      [score_2]    Fallback term 'CV' → MONDO_0011057 (cerebrovascular disorder) — re-scoring
+09:44:00  INFO      [score_0]      GIPR (ENSG00000010310) x 'Cardiovascular Risk/Disease' -> 0.1138
+09:44:01  INFO      [score_2]      GIPR (ENSG00000010310) x 'CV Risk Reduction' -> 0.0050
+09:44:01  INFO      [score_0]      GLP1R (ENSG00000112164) x 'Cardiovascular Risk/Disease' -> 0.2314
+09:44:01  INFO      [score_0]    -> Max score for 'Cardiovascular Risk/Disease': 0.2314
+09:44:01  INFO      [score_1]      GLP1R (ENSG00000112164) x 'MASH' -> 0.4140
+09:44:01  INFO      [score_1]    -> Max score for 'MASH': 0.4140
+09:44:01  INFO      [score_0]      GIPR (ENSG00000010310) x 'Metabolic Associated Liver Disease (Malo)' -> N/A
+09:44:01  INFO      [score_2]      GLP1R (ENSG00000112164) x 'CV Risk Reduction' -> 0.0136
+09:44:01  INFO      [score_2]    -> Max score for 'CV Risk Reduction': 0.0136
+09:44:01  INFO      [score_1]      GIPR (ENSG00000010310) x 'Metabolic Dysfunction-Associated Steatotic Liver Disease (Masld)' -> 0.0990
+09:44:02  INFO      [score_1]      GLP1R (ENSG00000112164) x 'Metabolic Dysfunction-Associated Steatotic Liver Disease (Masld)' -> 0.5345
+09:44:02  INFO      [score_2]      GIPR (ENSG00000010310) x 'MACE Reduction' -> N/A
+09:44:02  INFO      [score_1]    -> Max score for 'Metabolic Dysfunction-Associated Steatotic Liver Disease (Masld)': 0.5345
+09:44:02  INFO      [score_0]      GLP1R (ENSG00000112164) x 'Metabolic Associated Liver Disease (Malo)' -> N/A
+09:44:02  WARNING   [score_0]    No scores for 'Metabolic Associated Liver Disease (Malo)' with MONDO_0009556 — trying fallback disease search
+09:44:02  INFO      [score_1]      GIPR (ENSG00000010310) x 'Cardiovascular (Cv) Outcomes' -> 0.2630
+09:44:02  INFO      [score_0]    OT disease search 'Metabolic Associated Liver Disease (Malo)' → picked MONDO_0009556 (malonic aciduria); other hits: [('MONDO_0013661', 'combined malonic and methylmalonic acidemia'), ('MONDO_0000688', 'inborn organic aciduria')]
+09:44:02  INFO      [score_2]      GLP1R (ENSG00000112164) x 'MACE Reduction' -> N/A
+09:44:02  INFO      [score_0]    Fallback term 'Metabolic Associated Liver Disease (Malo)' → same ID MONDO_0009556 already tried, skipping
+09:44:02  WARNING   [score_2]    No scores for 'MACE Reduction' with EFO_0020863 — trying fallback disease search
+09:44:03  INFO      [score_1]      GLP1R (ENSG00000112164) x 'Cardiovascular (Cv) Outcomes' -> 0.3791
+09:44:03  INFO      [score_1]    -> Max score for 'Cardiovascular (Cv) Outcomes': 0.3791
+09:44:03  INFO      [score_0]    OT disease search 'Metabolic Associated Liver Disease' → picked MONDO_0013209 (metabolic dysfunction-associated steatotic liver disease); other hits: [('MONDO_0005066', 'metabolic disease'), ('Orphanet_101940', 'Rare metabolic liver disease')]
+09:44:03  INFO      [score_0]    Fallback term 'Metabolic Associated Liver Disease' → MONDO_0013209 (metabolic dysfunction-associated steatotic liver disease) — re-scoring
+09:44:03  WARNING   [score_2]    Fallback term 'MACE Reduction' → no OT match
+09:44:03  INFO      [score_0]      GIPR (ENSG00000010310) x 'Metabolic Associated Liver Disease (Malo)' -> 0.0990
+09:44:03  INFO      [score_1]      GIPR (ENSG00000010310) x 'Psoriatic Arthritis' -> 0.2596
+09:44:03  INFO      [score_2]    OT disease search 'MACE' → picked EFO_0020863 (major adverse cardiovascular event measurement); other hits: [('MONDO_0021340', 'intertrigo'), ('MONDO_0014272', 'palmoplantar keratoderma, Nagashima type')]
+09:44:03  INFO      [score_2]    Fallback term 'MACE' → same ID EFO_0020863 already tried, skipping
+09:44:03  INFO      [score_2]    -> Max score for 'MACE Reduction': 0.0000
+09:44:04  INFO      [score_0]      GLP1R (ENSG00000112164) x 'Metabolic Associated Liver Disease (Malo)' -> 0.5345
+09:44:04  INFO      [score_0]    -> Max score for 'Metabolic Associated Liver Disease (Malo)': 0.5345
+09:44:04  INFO      [score_1]      GLP1R (ENSG00000112164) x 'Psoriatic Arthritis' -> 0.2800
+09:44:04  INFO      [score_1]    -> Max score for 'Psoriatic Arthritis': 0.2800
+09:44:04  INFO      [MainThread]  
+── Step 4: Saving to C:\Users\P90022569\Downloads\BOOK3_OUTPUT.xlsx
+09:44:04  INFO      [MainThread]  ✅ Saved: C:\Users\P90022569\Downloads\BOOK3_OUTPUT.xlsx
+09:44:04  INFO      [MainThread]  
+── Summary ───────────────────────────────────────────────────────
+09:44:04  INFO      [MainThread]    Total rows           : 94
+09:44:04  INFO      [MainThread]    Secondary rows       : 94
+09:44:04  INFO      [MainThread]    MoA targets resolved : 2 / 2
+09:44:04  INFO      [MainThread]    Indications resolved : 15 / 16 (secondary only)
+09:44:04  INFO      [MainThread]    Scores found         : 14 / 16
+09:44:04  INFO      [MainThread]    Cache saved to       : C:\Users\P90022569\Downloads\Book3_cache.json
+
+📊 Score results:
   Cardiovascular Disease                        0.3791      (cardiovascular disorder)
   Hypertension                                  0.4832      (Hypertension)
   Dyslipidemia                                  0.0118      (inherited lipid metabolism disorder)
