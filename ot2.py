@@ -150,6 +150,7 @@ MEDICAL_SYNONYMS: dict[str, list[str]] = {
     "mash":    ["metabolic dysfunction-associated steatohepatitis", "steatohepatitis"],
     "masld":   ["metabolic dysfunction-associated steatotic liver disease"],
     "mace":    ["major adverse cardiovascular event", "cardiovascular disease"],
+    "cv":      ["cardiovascular disease"],  # "CV" alone is ambiguous (cerebrovascular vs cardiovascular)
     "ckd":     ["chronic kidney disease"],
     "copd":    ["chronic obstructive pulmonary disease"],
     "osa":     ["obstructive sleep apnea"],
@@ -344,14 +345,32 @@ def ot_search_disease(name: str) -> tuple[str | None, str | None]:
     query_words = set(re.findall(r"[a-z]{3,}", name.lower()))
     best_id, best_name, best_score = None, None, -1
 
-    for cid, cname in candidates:
-        score = 0
+    for rank, (cid, cname) in enumerate(candidates):
+        score = 0.0
+        cname_lower = (cname or "").lower()
+        query_lower = name.lower().strip()
+
+        # Big bonus for being an actual disease (not a measurement/process)
         if _is_disease_hit(cname):
-            score += 10  # big bonus for being an actual disease
-        # word overlap bonus
-        hit_words = set(re.findall(r"[a-z]{3,}", (cname or "").lower()))
+            score += 100
+
+        # Exact match bonus — "dyslipidemia" should beat "syndromic dyslipidemia"
+        if cname_lower == query_lower:
+            score += 50
+
+        # Word overlap bonus
+        hit_words = set(re.findall(r"[a-z]{3,}", cname_lower))
         overlap = len(query_words & hit_words)
-        score += overlap
+        score += overlap * 5
+
+        # Specificity penalty — penalize hits that have many extra words
+        # "syndromic dyslipidemia" has 1 extra word vs "dyslipidemia" query → penalty
+        extra_words = len(hit_words - query_words)
+        score -= extra_words * 2
+
+        # Search-rank tiebreaker — OT returns results in relevance order
+        score -= rank * 0.1
+
         if score > best_score:
             best_score = score
             best_id, best_name = cid, cname
