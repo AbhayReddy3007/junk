@@ -1,10 +1,16 @@
-indication	ot_disease_name	association_score
-Cardiovascular Disease	cardiovascular disorder	0.379127935
-Dyslipidemia	syndromic dyslipidemia	0
-Hypertension	Hypertension	0.483221067
-Increased Cardiovascular Risk	metabolic syndrome	0.231427375
-CV Risk Reduction	cerebrovascular disorder	0.01357848
-Metabolic Associated Liver Disease (Malo)	malonic aciduria	0.534462207
-MASH	metabolic dysfunction-associated steatohepatitis	0.413960709
-Cardiovascular (Cv) Outcomes	cardiovascular disorder	0.379127935
-HFpEF	heart failure	0.271370951
+  Cardiovascular Disease                        0.3791      (cardiovascular disorder)
+  Hypertension                                  0.4832      (Hypertension)
+  Dyslipidemia                                  0.0000      (syndromic dyslipidemia)
+  NAFLD                                         0.4140      (metabolic dysfunction-associated steatohepatitis)
+  CV Risk Reduction                             0.3791      (cardiovascular disorder)
+  NASH                                          0.4140      (metabolic dysfunction-associated steatohepatitis)
+  Prediabetes                                   0.3851      (prediabetes syndrome)  (also: Pre-Diabetes)
+  Increased Cardiovascular Risk                 0.0037      (hyperhomocysteinemia)
+  Cardiovascular Risk/Disease                   0.3791      (cardiovascular disorder)
+  MASH                                          0.4140      (Haddad syndrome)
+  Metabolic Associated Liver Disease (Malo)     0.5345      (malonic aciduria)
+  Metabolic Dysfunction-Associated Steatotic Liver Disease (Masld) 0.5345      (metabolic dysfunction-associated steatotic liver disease)
+  MACE Reduction                                0.3791      (major adverse cardiovascular event measurement)
+  Cardiovascular (Cv) Outcomes                  0.3791      (cardiovascular disorder)
+  Psoriatic Arthritis                           0.2800      (psoriatic arthritis)
+  HFpEF                                         0.2714      (heart failure)
