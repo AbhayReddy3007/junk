@@ -75,6 +75,10 @@ if "--clear-cache" in sys.argv:
         print(f"ℹ️  No cache to clear: {CACHE_FILE}")
     # Continue running — the script will rebuild the cache from scratch
 
+FORCE_RESOLVE = "--force-resolve" in sys.argv
+if FORCE_RESOLVE:
+    print("🔄 Force-resolve mode: ignoring indication cache, re-resolving all.")
+
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -145,14 +149,15 @@ OT_DATASOURCE_WEIGHTS = [
 MEDICAL_SYNONYMS: dict[str, list[str]] = {
     "hfpef":   ["heart failure with preserved ejection fraction", "heart failure"],
     "hfref":   ["heart failure with reduced ejection fraction", "heart failure"],
-    "nafld":   ["non-alcoholic fatty liver disease", "metabolic dysfunction-associated steatotic liver disease"],
+    "nafld":   ["non-alcoholic fatty liver disease", "metabolic dysfunction-associated steatotic liver disease", "fatty liver disease"],
     "nash":    ["non-alcoholic steatohepatitis", "metabolic dysfunction-associated steatohepatitis"],
-    "mash":    ["metabolic dysfunction-associated steatohepatitis", "steatohepatitis"],
-    "masld":   ["metabolic dysfunction-associated steatotic liver disease"],
+    "mash":    ["metabolic dysfunction-associated steatohepatitis", "non-alcoholic steatohepatitis"],
+    "masld":   ["metabolic dysfunction-associated steatotic liver disease", "non-alcoholic fatty liver disease"],
+    "malo":    ["metabolic dysfunction-associated steatotic liver disease", "fatty liver disease"],
     "mace":    ["major adverse cardiovascular event", "cardiovascular disease"],
-    "cv":      ["cardiovascular disease"],  # "CV" alone is ambiguous (cerebrovascular vs cardiovascular)
-    "dyslipidemia": ["dyslipidaemia"],  # OT may index British spelling
-    "dyslipidaemia": ["dyslipidemia"],
+    "cv":      ["cardiovascular disease"],
+    "dyslipidemia":  ["dyslipidaemia", "hyperlipidemia"],
+    "dyslipidaemia": ["dyslipidemia", "hyperlipidaemia"],
     "ckd":     ["chronic kidney disease"],
     "copd":    ["chronic obstructive pulmonary disease"],
     "osa":     ["obstructive sleep apnea"],
@@ -726,24 +731,96 @@ def resolve_indications(
             else:
                 log.warning("  ⚠️  '%s' not in cache — querying OT search API", ind)
 
-            # Try primary name first, then progressively simplified fallbacks
-            ot_id, ot_name = None, None
+            # Try ALL search terms and collect candidates, then pick the best
             search_terms = [ind] + _fallback_search_terms(ind)
+            candidates: list[tuple[str, str, str]] = []  # (term_used, ot_id, ot_name)
+
             for term in search_terms:
                 ot_id, ot_name = ot_search_disease(term)
                 if ot_id:
-                    if term != ind:
-                        log.info("    ✅ OT search resolved '%s' via '%s' → %s (%s)", ind, term, ot_id, ot_name)
-                    else:
-                        log.info("    ✅ OT search resolved '%s' → %s (%s)", ind, ot_id, ot_name)
-                    break
-                log.warning("    ↩ Term '%s' → no match", term)
+                    candidates.append((term, ot_id, ot_name))
+                    # Early exit: if we find an exact name match, no need to keep searching
+                    if (ot_name or "").lower().strip() == ind.lower().strip():
+                        log.info("    ✅ Exact match for '%s' → %s (%s)", ind, ot_id, ot_name)
+                        break
+                    # Also accept British/American spelling variant as exact
+                    ot_lower = (ot_name or "").lower().strip()
+                    ind_lower = ind.lower().strip()
+                    if (re.sub(r"aemia\b", "emia", ot_lower) == ind_lower or
+                        re.sub(r"emia\b", "aemia", ot_lower) == ind_lower):
+                        log.info("    ✅ Spelling-variant match for '%s' → %s (%s)", ind, ot_id, ot_name)
+                        break
+                else:
+                    log.warning("    ↩ Term '%s' → no match", term)
 
-            ind_map[ind] = (ot_id, ot_name)
-            cached[ind] = {"id": ot_id, "name": ot_name}
+            # Pick the best candidate using relevance scoring
+            # Key insight: when a synonym expansion like "metabolic dysfunction-
+            # associated steatohepatitis" (for MASH) returns an exact match, that
+            # should score very high — even though it has zero word overlap with
+            # the original "MASH". We check match against BOTH the original
+            # indication and the search term that produced the candidate.
+            best_id, best_name = None, None
+            if candidates:
+                ind_words = set(re.findall(r"[a-z]{3,}", ind.lower()))
+                best_score = -999.0
+                for term_used, cid, cname in candidates:
+                    score = 0.0
+                    cname_lower = (cname or "").lower().strip()
+                    term_lower = (term_used or "").lower().strip()
+                    ind_lower_s = ind.lower().strip()
+
+                    # Exact match against ORIGINAL indication
+                    if cname_lower == ind_lower_s:
+                        score += 200
+                    elif re.sub(r"aemia\b", "emia", cname_lower) == ind_lower_s:
+                        score += 200
+                    elif re.sub(r"emia\b", "aemia", cname_lower) == ind_lower_s:
+                        score += 200
+                    # Exact match against the SEARCH TERM (synonym expansion)
+                    elif cname_lower == term_lower:
+                        score += 150
+                    elif re.sub(r"aemia\b", "emia", cname_lower) == term_lower:
+                        score += 150
+                    # Close match: search term is contained in result name
+                    elif term_lower in cname_lower:
+                        score += 80
+
+                    # Disease vs measurement
+                    if _is_disease_hit(cname):
+                        score += 100
+
+                    # Word overlap with original indication
+                    hit_words = set(re.findall(r"[a-z]{3,}", cname_lower))
+                    score += len(ind_words & hit_words) * 5
+
+                    # Word overlap with search term (captures synonym matches)
+                    term_words = set(re.findall(r"[a-z]{3,}", term_lower))
+                    score += len(term_words & hit_words) * 3
+
+                    # Penalize extra words (subtypes, unrelated qualifiers)
+                    # Heavier penalty: "Gaucher disease - ophthalmoplegia - cardiovascular calcification"
+                    # has 5 extra words and should lose to "cardiovascular disorder" with 1 extra
+                    all_query_words = ind_words | term_words
+                    extra = len(hit_words - all_query_words)
+                    score -= extra * 4
+
+                    log.debug("    Score for '%s' (via '%s'): %.1f [%s]",
+                              cname, term_used, score, cid)
+                    if score > best_score:
+                        best_score = score
+                        best_id, best_name = cid, cname
+
+                if len(candidates) > 1:
+                    log.info("    🏆 Best of %d candidates for '%s': %s (%s) score=%.1f",
+                             len(candidates), ind, best_id, best_name, best_score)
+
+            ind_map[ind] = (best_id, best_name)
+            cached[ind] = {"id": best_id, "name": best_name}
             cache_updated = True
 
-            if not ot_id:
+            if best_id:
+                log.info("    ✅ Resolved '%s' → %s (%s)", ind, best_id, best_name)
+            else:
                 log.warning("    ❌ OT search could not resolve '%s'", ind)
 
     if cache_updated:
