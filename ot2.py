@@ -66,6 +66,15 @@ if not OUTPUT_FILE:
 if not CACHE_FILE:
     CACHE_FILE = str(_inp.parent / f"{_inp.stem}_cache.json")
 
+# ── Optional --clear-cache flag ───────────────────────────────────────────────
+if "--clear-cache" in sys.argv:
+    if Path(CACHE_FILE).exists():
+        Path(CACHE_FILE).unlink()
+        print(f"🗑️  Deleted cache: {CACHE_FILE}")
+    else:
+        print(f"ℹ️  No cache to clear: {CACHE_FILE}")
+    # Continue running — the script will rebuild the cache from scratch
+
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -117,7 +126,60 @@ OT_DATASOURCE_WEIGHTS = [
     {"id": "impc",                   "weight": 1, "propagate": True},
 ]
 
-# ── Cache helpers ──────────────────────────────────────────────────────────────
+# ── Disease name overrides ─────────────────────────────────────────────────────
+# The OT search API's text search often returns the wrong first hit for clinical
+# shorthand, acronyms, and composite terms. This map provides known-correct
+# (disease_id, disease_name) tuples so we bypass the unreliable search for these.
+#
+# HOW TO MAINTAIN: if you see a wrong mapping in the logs, look up the correct
+# disease on https://platform.opentargets.org, find its EFO/MONDO ID, and add
+# a normalized-lowercase entry here. The lookup key is case-folded + stripped.
+#
+# To find correct OT IDs: go to platform.opentargets.org, search the disease
+# name, and copy the ID from the URL (e.g. /disease/EFO_0003890).
+# ── Medical acronym / synonym expansion ───────────────────────────────────────
+# These are NOT ID overrides — they expand clinical shorthand into full
+# search-friendly terms so OT's text search can find the right entity.
+# Add new acronyms here as needed.  They are tried as extra search terms
+# alongside the original, and the best-matching hit is picked.
+MEDICAL_SYNONYMS: dict[str, list[str]] = {
+    "hfpef":   ["heart failure with preserved ejection fraction", "heart failure"],
+    "hfref":   ["heart failure with reduced ejection fraction", "heart failure"],
+    "nafld":   ["non-alcoholic fatty liver disease", "metabolic dysfunction-associated steatotic liver disease"],
+    "nash":    ["non-alcoholic steatohepatitis", "metabolic dysfunction-associated steatohepatitis"],
+    "mash":    ["metabolic dysfunction-associated steatohepatitis", "steatohepatitis"],
+    "masld":   ["metabolic dysfunction-associated steatotic liver disease"],
+    "mace":    ["major adverse cardiovascular event", "cardiovascular disease"],
+    "ckd":     ["chronic kidney disease"],
+    "copd":    ["chronic obstructive pulmonary disease"],
+    "osa":     ["obstructive sleep apnea"],
+    "t2dm":    ["type 2 diabetes mellitus"],
+    "t1dm":    ["type 1 diabetes mellitus"],
+    "aud":     ["alcohol use disorder"],
+    "pcos":    ["polycystic ovary syndrome"],
+    "ibs":     ["irritable bowel syndrome"],
+    "ra":      ["rheumatoid arthritis"],
+    "sle":     ["systemic lupus erythematosus"],
+    "ms":      ["multiple sclerosis"],
+    "als":     ["amyotrophic lateral sclerosis"],
+}
+
+# ── OT entity type filters (reject measurements / non-disease hits) ───────────
+# Prefixes that indicate the hit is a measurement, process, or phenotype
+# and should be ranked below actual disease hits.
+_MEASUREMENT_PREFIXES = ("measurement", "process", "risk measurement", "risk factor")
+
+
+def _is_disease_hit(hit_name: str | None) -> bool:
+    """Return True if the hit looks like an actual disease, not a measurement."""
+    if not hit_name:
+        return False
+    lower = hit_name.lower()
+    for prefix in _MEASUREMENT_PREFIXES:
+        if prefix in lower:
+            return False
+    return True
+
 
 def load_cache() -> dict:
     """Load cache from disk, returning empty structure on first run."""
@@ -250,9 +312,16 @@ def ot_search_target(name: str) -> tuple[str | None, str | None]:
 
 
 def ot_search_disease(name: str) -> tuple[str | None, str | None]:
+    """
+    Search OT for a disease, returning (id, name).
+    Fetches up to 5 hits and picks the best one:
+      1. Prefer hits whose name is an actual disease (not a measurement/process).
+      2. Among disease hits, prefer those whose name contains a word from the query.
+      3. Fall back to first hit if none qualify above.
+    """
     query = """
     query SearchDisease($q: String!) {
-      search(queryString: $q, entityNames: ["disease"], page: {index: 0, size: 3}) {
+      search(queryString: $q, entityNames: ["disease"], page: {index: 0, size: 5}) {
         hits {
           id
           object { ... on Disease { name } }
@@ -261,21 +330,41 @@ def ot_search_disease(name: str) -> tuple[str | None, str | None]:
     }
     """
     data = _ot_post(query, {"q": name}, context=f"disease:{name}")
-    if data:
-        hits = data.get("search", {}).get("hits", [])
-        if hits:
-            h = hits[0]
-            matched_id   = h["id"]
-            matched_name = h["object"].get("name")
-            # Log all candidates so incorrect first-hits are visible
-            if len(hits) > 1:
-                alts = [(x["id"], x["object"].get("name")) for x in hits[1:]]
-                log.info("  OT disease search '%s' → picked %s (%s); other hits: %s",
-                         name, matched_id, matched_name, alts)
-            else:
-                log.info("  OT disease search '%s' → %s (%s)", name, matched_id, matched_name)
-            return matched_id, matched_name
-    return None, None
+    if not data:
+        return None, None
+
+    hits = data.get("search", {}).get("hits", [])
+    if not hits:
+        return None, None
+
+    # Extract all candidates
+    candidates = [(h["id"], h["object"].get("name", "")) for h in hits]
+
+    # Score candidates: disease hits that share words with the query rank highest
+    query_words = set(re.findall(r"[a-z]{3,}", name.lower()))
+    best_id, best_name, best_score = None, None, -1
+
+    for cid, cname in candidates:
+        score = 0
+        if _is_disease_hit(cname):
+            score += 10  # big bonus for being an actual disease
+        # word overlap bonus
+        hit_words = set(re.findall(r"[a-z]{3,}", (cname or "").lower()))
+        overlap = len(query_words & hit_words)
+        score += overlap
+        if score > best_score:
+            best_score = score
+            best_id, best_name = cid, cname
+
+    # Log what happened
+    if len(candidates) > 1:
+        log.info("  OT disease search '%s' → picked %s (%s); other hits: %s",
+                 name, best_id, best_name,
+                 [(c, n) for c, n in candidates if c != best_id])
+    else:
+        log.info("  OT disease search '%s' → %s (%s)", name, best_id, best_name)
+
+    return best_id, best_name
 
 
 def ot_association_score(disease_id: str, target_id: str) -> float | None:
@@ -645,29 +734,69 @@ def _fallback_search_terms(ind: str) -> list[str]:
     Applied both at resolution time (cache miss) and scoring time (zero scores).
 
     Steps applied in order:
+      0. Medical synonym expansion (HFpEF → heart failure with preserved ejection fraction)
       1. Strip parenthetical qualifiers  "Alcohol Use Disorder (AUD)" -> "Alcohol Use Disorder"
-      2. Replace separators (/, -)       "Cardiovascular Risk/Disease" -> "Cardiovascular Risk Disease"
-      3. Replace hyphens in compound words "Pre-Diabetes" -> "Pre Diabetes"
-      4. Progressively shorten: first 3 words, first 2, first word
+      2. Strip action/outcome words (Reduction, Risk, Outcomes) that aren't diseases
+      3. Replace separators (/, -)       "Cardiovascular Risk/Disease" -> "Cardiovascular Risk Disease"
+      4. Replace hyphens in compound words "Pre-Diabetes" -> "Pre Diabetes"
+      5. Progressively shorten: first 3 words, first 2, first word
     Deduplicates and removes the original term.
     """
     terms = []
-    # Strip parenthetical acronym/qualifier
-    stripped = re.sub(r"\s*\(.*?\)", "", ind).strip()
-    if stripped and stripped != ind:
-        terms.append(stripped)
-    base = stripped if stripped else ind
-    # Replace slash separator
-    slashed = re.sub(r"[/]", " ", base).strip()
+
+    # ── Step 0: Strip parenthetical qualifier early ──────────────────────
+    stripped_base = re.sub(r"\s*\(.*?\)", "", ind).strip()
+    base = stripped_base if stripped_base else ind
+
+    # ── Step 1: Strip action/outcome/qualifier words ─────────────────────
+    # These words make sense in a clinical pipeline but not in an OT search
+    ACTION_WORDS = r"\b(reduction|risk\s+reduction|outcomes|risk|prevention|increased|decreased)\b"
+    cleaned = re.sub(ACTION_WORDS, "", base, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"\s*/\s*", " ", cleaned)  # also clean slashes
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    # ── Step 2: Medical synonym expansion ────────────────────────────────
+    # Try the full indication, the stripped version, the cleaned version,
+    # and any parenthetical acronym — in that order
+    ind_lower = ind.strip().lower()
+    for candidate in [ind_lower, base.lower(), cleaned.lower()]:
+        if candidate in MEDICAL_SYNONYMS:
+            terms.extend(MEDICAL_SYNONYMS[candidate])
+    # Check parenthetical acronym: "Metabolic Associated Liver Disease (Malo)" → "malo"
+    paren_match = re.search(r"\(([^)]+)\)", ind)
+    if paren_match:
+        acronym = paren_match.group(1).strip().lower()
+        if acronym in MEDICAL_SYNONYMS:
+            terms.extend(MEDICAL_SYNONYMS[acronym])
+
+    # ── Step 3: Add stripped-parens version if different ──────────────────
+    if stripped_base and stripped_base != ind:
+        terms.append(stripped_base)
+
+    # ── Step 4: Add action-word-stripped version ─────────────────────────
+    if cleaned and cleaned.lower() != base.lower() and len(cleaned) > 1:
+        terms.append(cleaned)
+        # Also try "<cleaned> disease" for short residuals like "CV" → "CV disease"
+        if len(cleaned.split()) <= 2:
+            terms.append(cleaned + " disease")
+        # Also check if the cleaned form has synonyms
+        if cleaned.lower() in MEDICAL_SYNONYMS:
+            terms.extend(MEDICAL_SYNONYMS[cleaned.lower()])
+
+    # ── Step 5: Replace slash separator ──────────────────────────────────
+    slashed = re.sub(r"\s*/\s*", " ", base).strip()
+    slashed = re.sub(r"\s+", " ", slashed).strip()
     if slashed != base:
         terms.append(slashed)
         base = slashed
-    # Replace hyphen separator (but not at word start like "non-")
+
+    # ── Step 6: Replace hyphen separator ─────────────────────────────────
     dehyphen = re.sub(r"(?<=[A-Za-z])-(?=[A-Za-z])", " ", base).strip()
     if dehyphen != base:
         terms.append(dehyphen)
         base = dehyphen
-    # Shorten progressively
+
+    # ── Step 7: Progressively shorten ────────────────────────────────────
     words = base.split()
     if len(words) > 3:
         terms.append(" ".join(words[:3]))
@@ -675,12 +804,13 @@ def _fallback_search_terms(ind: str) -> list[str]:
         terms.append(" ".join(words[:2]))
     if len(words) > 1:
         terms.append(words[0])
+
     # Deduplicate preserving order, skip original
-    seen = {ind}
+    seen = {ind.lower()}
     result = []
     for t in terms:
-        if t and t not in seen:
-            seen.add(t)
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
             result.append(t)
     return result
 
