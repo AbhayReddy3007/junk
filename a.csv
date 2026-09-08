@@ -1,41 +1,16 @@
-
-Phase 
-
-Obvious 
-
-Indirect 
-
-Novel 
-
-Phase 1 
-
-0.10 
-
-0.10 
-
-0.10 
-
-Phase 2 
-
-0.40 
-
-0.35 
-
-0.30 
-
-Phase 3 
-
-0.80 
-
-0.65 
-
-0.55 
-
-Approved 
-
-1.00 
-
-1.00 
-
-1.00 
-
+  Cardiovascular Disease                        0.3791      (cardiovascular disorder)
+  Hypertension                                  0.4832      (Hypertension)
+  Dyslipidemia                                  0.0118      (inherited lipid metabolism disorder)
+  NAFLD                                         0.5345      (metabolic dysfunction-associated steatotic liver disease)
+  CV Risk Reduction                             0.0136      (tonsillectomy risk measurement)
+  NASH                                          0.4140      (metabolic dysfunction-associated steatohepatitis)
+  Prediabetes                                   0.3851      (prediabetes syndrome)  (also: Pre-Diabetes)
+  Increased Cardiovascular Risk                 0.2314      (metabolic syndrome)
+  Cardiovascular Risk/Disease                   0.2314      (metabolic syndrome)
+  MASH                                          0.4140      (metabolic dysfunction-associated steatohepatitis)
+  Metabolic Associated Liver Disease (Malo)     0.5345      (malonic aciduria)
+  Metabolic Dysfunction-Associated Steatotic Liver Disease (Masld) 0.5345      (metabolic dysfunction-associated steatotic liver disease)
+  MACE Reduction                                0.0000      (major adverse cardiovascular event measurement)
+  Cardiovascular (Cv) Outcomes                  0.3791      (cardiovascular disorder)
+  Psoriatic Arthritis                           0.2800      (psoriatic arthritis)
+  HFpEF                                         0.0000      (unresolved)
