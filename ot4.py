@@ -499,89 +499,163 @@ def fetch_all_target_diseases(
     return all_diseases
 
 
-def match_indication_to_ot_diseases(
-    ind: str,
+def _gemini_match_batch(
+    indications: list[str],
     ot_diseases: list[tuple[str, str]],
-) -> tuple[str | None, str | None]:
+) -> list[tuple[str, str | None, str | None]]:
     """
-    Match a plain-text indication against a pre-fetched list of OT diseases.
+    Send one Gemini call to match a batch of indications against the OT disease list.
 
-    Scoring rules (same philosophy as resolve_indications candidate scoring):
-      +200  Exact name match with the indication (case-insensitive)
-      +200  Exact match after British ↔ American spelling normalisation
-      +150  Exact match against a MEDICAL_SYNONYM of the indication
-      +100  Result is an actual disease (not a measurement/process)
-       +5×  Word overlap between indication and OT disease name (per shared word ≥3 chars)
-       -4×  PENALTY: extra words in the OT name not in the indication
+    The full disease list is embedded in the prompt so Gemini can do semantic
+    matching — handling synonyms, acronyms, spelling variants, and clinical
+    shorthand that rule-based scoring would miss.
 
-    Returns (disease_id, disease_name) for the best match, or (None, None) if
-    no candidate scores above the minimum threshold (20).
+    Returns list of (indication, matched_disease_id, matched_disease_name).
+    matched_disease_id is None if Gemini could not find a confident match.
     """
-    MIN_SCORE = 20.0
+    # Format disease list as numbered lines: "1. obesity | EFO_0001073"
+    disease_lines = "\n".join(
+        f"{i+1}. {dname} | {did}"
+        for i, (did, dname) in enumerate(ot_diseases)
+    )
 
-    # Build the set of query terms to check for exact matches:
-    # original indication + all known medical synonyms for it
-    ind_lower = ind.lower().strip()
-    ind_lower_nohy = re.sub(r"(?<=\w)-(?=\w)", "", ind_lower)  # pre-diabetes → prediabetes
-    synonym_expansions: set[str] = set()
-    for key in [ind_lower, ind_lower_nohy]:
-        if key in MEDICAL_SYNONYMS:
-            for syn in MEDICAL_SYNONYMS[key]:
-                synonym_expansions.add(syn.lower().strip())
+    ind_numbered = "\n".join(f"{i+1}. {ind}" for i, ind in enumerate(indications))
 
-    ind_words = set(re.findall(r"[a-z]{3,}", ind_lower))
+    prompt = (
+        "You are a biomedical terminology expert. Below is a numbered list of diseases "
+        "from the OpenTargets Platform, followed by a list of clinical indications.\n\n"
+        "Your task: for each indication, find the BEST matching disease from the disease list. "
+        "Consider synonyms, acronyms, spelling variants (British/American), and clinical shorthand.\n\n"
+        "STRICT OUTPUT RULES:\n"
+        "- Output ONLY a valid JSON array. No prose, no markdown, no ```json fences.\n"
+        "- One object per indication, in the same order as the input indications.\n"
+        "- Each object must have exactly these keys:\n"
+        '  {"indication": "<exact indication text>", '
+        '"id": "<EFO_/MONDO_ ID from the disease list, or null if no confident match>", '
+        '"name": "<disease name from the disease list, or null>"}\n'
+        "- Use JSON null (not the string \"null\") when no confident match exists.\n"
+        "- Only pick from the provided disease list — do NOT invent IDs.\n\n"
+        f"DISEASE LIST:\n{disease_lines}\n\n"
+        f"INDICATIONS TO MATCH:\n{ind_numbered}\n\n"
+        "JSON array output:"
+    )
 
-    best_id, best_name, best_score = None, None, -999.0
+    text = gemini_search(prompt)
+    log.debug("  Gemini match batch raw (first 800 chars):\n%s", text[:800])
 
-    for did, dname in ot_diseases:
-        dname_lower = (dname or "").lower().strip()
-        if not dname_lower:
+    parsed = _clean_and_parse_json(text)
+    if not parsed:
+        log.warning("  _gemini_match_batch: empty parse result")
+        return [(ind, None, None) for ind in indications]
+
+    # Build a lookup of valid disease IDs for validation
+    valid_ids = {did: dname for did, dname in ot_diseases}
+
+    results = []
+    for item in parsed:
+        ind  = item.get("indication", "")
+        did  = item.get("id") or None
+        name = item.get("name") or None
+
+        # Validate that the returned ID actually exists in the disease list
+        if did and did not in valid_ids:
+            log.warning(
+                "  Gemini returned unknown disease ID '%s' for '%s' — discarding",
+                did, ind,
+            )
+            did, name = None, None
+
+        # If ID is valid but name is missing/wrong, use the canonical name from the list
+        if did and did in valid_ids:
+            name = valid_ids[did]
+
+        results.append((ind, did, name))
+
+    # Pad with (None, None) if Gemini returned fewer items than expected
+    while len(results) < len(indications):
+        results.append((indications[len(results)], None, None))
+
+    return results
+
+
+# Chunk size: max diseases sent to Gemini per call.
+# OT disease lists for a target can be 5,000+; chunking keeps prompt size manageable.
+# Each chunk is scored independently and the best match across chunks is kept.
+_DISEASE_CHUNK_SIZE = 200
+
+
+def match_indications_to_ot_diseases(
+    indications: list[str],
+    ot_diseases: list[tuple[str, str]],
+) -> dict[str, tuple[str | None, str | None]]:
+    """
+    Use Gemini to match ALL indications against the full OT target-disease list.
+
+    Strategy:
+    - Split the disease list into chunks of _DISEASE_CHUNK_SIZE to stay within
+      prompt limits while still giving Gemini a rich candidate pool.
+    - For each chunk, send ALL indications in one Gemini call so Gemini can
+      reason across them together.
+    - Track the best match per indication across all chunks (first non-null win,
+      since earlier chunks contain higher-scored OT diseases).
+    - Retry each chunk once on parse failure; unresolved indications after all
+      chunks are returned as (None, None).
+
+    Returns dict of indication → (disease_id, disease_name).
+    """
+    # Start with all indications unresolved
+    result: dict[str, tuple[str | None, str | None]] = {ind: (None, None) for ind in indications}
+    remaining = list(indications)  # indications still needing a match
+
+    total_chunks = (len(ot_diseases) + _DISEASE_CHUNK_SIZE - 1) // _DISEASE_CHUNK_SIZE
+    log.info(
+        "  match_indications_to_ot_diseases: %d indications × %d diseases → %d chunk(s)",
+        len(indications), len(ot_diseases), total_chunks,
+    )
+
+    for chunk_idx in range(total_chunks):
+        if not remaining:
+            break  # all indications resolved
+
+        chunk = ot_diseases[chunk_idx * _DISEASE_CHUNK_SIZE:(chunk_idx + 1) * _DISEASE_CHUNK_SIZE]
+        log.info(
+            "  Chunk %d/%d: matching %d indications against %d diseases",
+            chunk_idx + 1, total_chunks, len(remaining), len(chunk),
+        )
+
+        # Retry once on failure
+        batch_results = None
+        for attempt in range(1, 3):
+            try:
+                batch_results = _gemini_match_batch(remaining, chunk)
+                if len(batch_results) == len(remaining):
+                    break
+                log.warning(
+                    "  Chunk %d attempt %d: got %d/%d results — retrying",
+                    chunk_idx + 1, attempt, len(batch_results), len(remaining),
+                )
+            except Exception as exc:
+                log.warning("  Chunk %d attempt %d failed: %s — retrying", chunk_idx + 1, attempt, exc)
+            time.sleep(2)
+
+        if not batch_results:
+            log.warning("  Chunk %d: all attempts failed, skipping", chunk_idx + 1)
             continue
 
-        score = 0.0
+        still_unresolved = []
+        for ind, did, name in batch_results:
+            if did:
+                result[ind] = (did, name)
+                log.info("    ✅ [Gemini] '%s' → %s (%s)", ind, did, name)
+            else:
+                still_unresolved.append(ind)
 
-        # ── Exact match against indication ───────────────────────────────
-        if dname_lower == ind_lower or dname_lower == ind_lower_nohy:
-            score += 200
-        # British ↔ American spelling
-        elif re.sub(r"aemia\b", "emia", dname_lower) == ind_lower:
-            score += 200
-        elif re.sub(r"emia\b", "aemia", dname_lower) == ind_lower:
-            score += 200
-        # Exact match against a medical synonym of the indication
-        elif dname_lower in synonym_expansions:
-            score += 150
-        elif re.sub(r"aemia\b", "emia", dname_lower) in synonym_expansions:
-            score += 150
+        remaining = still_unresolved  # only keep searching for unresolved ones
 
-        # ── Disease vs measurement ────────────────────────────────────────
-        if _is_disease_hit(dname):
-            score += 100
+    for ind in remaining:
+        log.warning("  ❌ [Gemini] No match found in disease list for '%s'", ind)
 
-        # ── Word overlap ─────────────────────────────────────────────────
-        dname_words = set(re.findall(r"[a-z]{3,}", dname_lower))
-        score += len(ind_words & dname_words) * 5
-
-        # ── Extra-word penalty (subtype penalty) ─────────────────────────
-        extra = len(dname_words - ind_words)
-        score -= extra * 4
-
-        if score > best_score:
-            best_score = score
-            best_id, best_name = did, dname
-
-    if best_score >= MIN_SCORE:
-        log.info(
-            "  match_indication_to_ot_diseases '%s' → %s (%s)  score=%.1f",
-            ind, best_id, best_name, best_score,
-        )
-        return best_id, best_name
-
-    log.debug(
-        "  match_indication_to_ot_diseases '%s' → no match above threshold (best=%.1f)",
-        ind, best_score,
-    )
-    return None, None
+    return result
 
 
 def ot_association_score(disease_id: str, target_id: str) -> float | None:
@@ -872,15 +946,13 @@ def resolve_indications(
 
     Resolution priority (first hit wins):
       1. Cache hit with a valid ID — reused directly, no API call.
-      2. Match against the pre-fetched target-disease list (ot_diseases) —
-         compares every indication against ALL diseases already associated with
-         the resolved MoA targets in OT, using fuzzy name + synonym scoring.
-         This is the new primary path and is fast (no extra API calls).
-      3. OT text search API — tries the indication and progressive fallback
-         terms against OT's search endpoint. Catches diseases that are in OT
-         but had zero association score with the targets (edge case).
-      4. (Unchanged) Gemini fallback inside _resolve_indication_batch() is
-         still available for truly unresolvable terms.
+      2. Gemini API match against the OT target-disease list — sends all
+         uncached indications + the full disease list to Gemini in batches
+         and lets the LLM do semantic matching (handles synonyms, acronyms,
+         spelling variants, clinical shorthand). IDs returned are validated
+         against the disease list before being accepted.
+      3. OT text search API fallback — for any indication Gemini could not
+         match, falls back to progressive OT search + synonym expansion.
 
     All new resolutions are written back to the cache immediately.
     OpenTargets scores are always fetched fresh on every run.
@@ -889,109 +961,118 @@ def resolve_indications(
     cached  = cache.get("indications", {})
     cache_updated = False
 
+    # ── Separate cached vs uncached indications ───────────────────────────────
+    need_resolution: list[str] = []
     for ind in unique_indications:
-        entry = cached.get(ind)
+        entry     = cached.get(ind)
         cached_id = entry.get("id") if entry else None
 
-        # ── Path 1: cache hit ──────────────────────────────────────────────
+        # Path 1: valid cache hit
         if entry and cached_id:
             ind_map[ind] = (cached_id, entry.get("name"))
             log.info("  💾 Cache hit '%s' → %s (%s)", ind, cached_id, entry.get("name"))
-            continue
-
-        if entry:
-            log.warning("  ⚠️  Cache has null ID for '%s' — re-resolving", ind)
         else:
-            log.warning("  ⚠️  '%s' not in cache — resolving", ind)
+            if entry:
+                log.warning("  ⚠️  Cache has null ID for '%s' — re-resolving", ind)
+            else:
+                log.warning("  ⚠️  '%s' not in cache — resolving", ind)
+            need_resolution.append(ind)
+
+    if not need_resolution:
+        return ind_map
+
+    # ── Path 2: Gemini matching against OT target-disease list ───────────────
+    gemini_unresolved: list[str] = list(need_resolution)
+
+    if ot_diseases:
+        log.info(
+            "\n  🤖 Gemini matching: %d indications against %d OT diseases",
+            len(need_resolution), len(ot_diseases),
+        )
+        gemini_results = match_indications_to_ot_diseases(need_resolution, ot_diseases)
+
+        gemini_unresolved = []
+        for ind in need_resolution:
+            did, name = gemini_results.get(ind, (None, None))
+            if did:
+                ind_map[ind] = (did, name)
+                cached[ind]  = {"id": did, "name": name}
+                cache_updated = True
+            else:
+                gemini_unresolved.append(ind)
+    else:
+        log.warning("  No OT disease list available — skipping Gemini match, going to OT search")
+
+    # ── Path 3: OT text search for anything Gemini couldn't match ────────────
+    if gemini_unresolved:
+        log.warning(
+            "\n  ↩ %d indication(s) unmatched by Gemini — falling back to OT text search: %s",
+            len(gemini_unresolved), gemini_unresolved,
+        )
+
+    for ind in gemini_unresolved:
+        search_terms = [ind] + _fallback_search_terms(ind)
+        candidates: list[tuple[str, str, str]] = []
+
+        for term in search_terms:
+            ot_id, ot_name = ot_search_disease(term)
+            if ot_id:
+                candidates.append((term, ot_id, ot_name))
+                if (ot_name or "").lower().strip() == ind.lower().strip():
+                    log.info("    ✅ Exact OT match for '%s' → %s (%s)", ind, ot_id, ot_name)
+                    break
+                ot_lower  = (ot_name or "").lower().strip()
+                ind_lower = ind.lower().strip()
+                if (re.sub(r"aemia\b", "emia", ot_lower) == ind_lower or
+                        re.sub(r"emia\b", "aemia", ot_lower) == ind_lower):
+                    log.info("    ✅ Spelling-variant OT match for '%s' → %s (%s)", ind, ot_id, ot_name)
+                    break
+            else:
+                log.warning("    ↩ Term '%s' → no OT match", term)
 
         best_id, best_name = None, None
+        if candidates:
+            ind_words  = set(re.findall(r"[a-z]{3,}", ind.lower()))
+            best_score = -999.0
+            for term_used, cid, cname in candidates:
+                score       = 0.0
+                cname_lower = (cname or "").lower().strip()
+                term_lower  = (term_used or "").lower().strip()
+                ind_lower_s = ind.lower().strip()
+                if cname_lower == ind_lower_s:
+                    score += 200
+                elif re.sub(r"aemia\b", "emia", cname_lower) == ind_lower_s:
+                    score += 200
+                elif re.sub(r"emia\b", "aemia", cname_lower) == ind_lower_s:
+                    score += 200
+                elif cname_lower == term_lower:
+                    score += 150
+                elif re.sub(r"aemia\b", "emia", cname_lower) == term_lower:
+                    score += 150
+                elif term_lower in cname_lower:
+                    score += 80
+                if _is_disease_hit(cname):
+                    score += 100
+                hit_words  = set(re.findall(r"[a-z]{3,}", cname_lower))
+                score     += len(ind_words & hit_words) * 5
+                term_words = set(re.findall(r"[a-z]{3,}", term_lower))
+                score     += len(term_words & hit_words) * 3
+                extra = len(hit_words - (ind_words | term_words))
+                score -= extra * 4
+                if score > best_score:
+                    best_score = score
+                    best_id, best_name = cid, cname
 
-        # ── Path 2: match against OT target-disease list ──────────────────
-        if ot_diseases:
-            best_id, best_name = match_indication_to_ot_diseases(ind, ot_diseases)
-            if best_id:
-                log.info(
-                    "    ✅ [target-disease list] '%s' → %s (%s)",
-                    ind, best_id, best_name,
-                )
-
-        # ── Path 3: OT text search (fallback) ────────────────────────────
-        if not best_id:
-            if ot_diseases is not None:
-                log.warning(
-                    "    ↩ No match in target-disease list for '%s' — falling back to OT search",
-                    ind,
-                )
-            search_terms = [ind] + _fallback_search_terms(ind)
-            candidates: list[tuple[str, str, str]] = []  # (term_used, ot_id, ot_name)
-
-            for term in search_terms:
-                ot_id, ot_name = ot_search_disease(term)
-                if ot_id:
-                    candidates.append((term, ot_id, ot_name))
-                    # Early exit on exact match
-                    if (ot_name or "").lower().strip() == ind.lower().strip():
-                        log.info("    ✅ Exact match for '%s' → %s (%s)", ind, ot_id, ot_name)
-                        break
-                    ot_lower  = (ot_name or "").lower().strip()
-                    ind_lower = ind.lower().strip()
-                    if (re.sub(r"aemia\b", "emia", ot_lower) == ind_lower or
-                            re.sub(r"emia\b", "aemia", ot_lower) == ind_lower):
-                        log.info("    ✅ Spelling-variant match for '%s' → %s (%s)", ind, ot_id, ot_name)
-                        break
-                else:
-                    log.warning("    ↩ Term '%s' → no match", term)
-
-            if candidates:
-                ind_words  = set(re.findall(r"[a-z]{3,}", ind.lower()))
-                best_score = -999.0
-                for term_used, cid, cname in candidates:
-                    score       = 0.0
-                    cname_lower = (cname or "").lower().strip()
-                    term_lower  = (term_used or "").lower().strip()
-                    ind_lower_s = ind.lower().strip()
-
-                    if cname_lower == ind_lower_s:
-                        score += 200
-                    elif re.sub(r"aemia\b", "emia", cname_lower) == ind_lower_s:
-                        score += 200
-                    elif re.sub(r"emia\b", "aemia", cname_lower) == ind_lower_s:
-                        score += 200
-                    elif cname_lower == term_lower:
-                        score += 150
-                    elif re.sub(r"aemia\b", "emia", cname_lower) == term_lower:
-                        score += 150
-                    elif term_lower in cname_lower:
-                        score += 80
-
-                    if _is_disease_hit(cname):
-                        score += 100
-
-                    hit_words  = set(re.findall(r"[a-z]{3,}", cname_lower))
-                    score     += len(ind_words & hit_words) * 5
-                    term_words = set(re.findall(r"[a-z]{3,}", term_lower))
-                    score     += len(term_words & hit_words) * 3
-
-                    all_query_words = ind_words | term_words
-                    extra = len(hit_words - all_query_words)
-                    score -= extra * 4
-
-                    log.debug("    Score for '%s' (via '%s'): %.1f [%s]",
-                              cname, term_used, score, cid)
-                    if score > best_score:
-                        best_score = score
-                        best_id, best_name = cid, cname
-
-                if len(candidates) > 1:
-                    log.info("    🏆 Best of %d candidates for '%s': %s (%s) score=%.1f",
-                             len(candidates), ind, best_id, best_name, best_score)
+            if len(candidates) > 1:
+                log.info("    🏆 Best OT candidate for '%s': %s (%s) score=%.1f",
+                         ind, best_id, best_name, best_score)
 
         ind_map[ind]  = (best_id, best_name)
         cached[ind]   = {"id": best_id, "name": best_name}
         cache_updated = True
 
         if best_id:
-            log.info("    ✅ Resolved '%s' → %s (%s)", ind, best_id, best_name)
+            log.info("    ✅ [OT search] Resolved '%s' → %s (%s)", ind, best_id, best_name)
         else:
             log.warning("    ❌ Could not resolve '%s'", ind)
 
