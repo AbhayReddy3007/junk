@@ -18,8 +18,8 @@ Excel Processing Script
        Tier 3 (lowest) : any other region / country
 9. Within each (TA - I, phase, primary_region) group, retains only the row
    with the highest size value.
-10. Adds a 'TA-I Comparison' sheet to the output file showing which TA-Is
-    from the input were retained, removed, or are new in the output.
+10. Adds a 'TA-I Comparison' sheet showing which TA-Is were retained or removed,
+    the step that caused removal, and a plain-English explanation of why.
 
 IMPORTANT — definition of 'size':
     size = number of patients in the drug/treatment arm(s) only.
@@ -50,10 +50,7 @@ import pandas as pd
 from dotenv import load_dotenv
 import os
 import openpyxl
-from openpyxl.styles import (
-    PatternFill, Font, Alignment, Border, Side
-)
-from openpyxl.utils import get_column_letter
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
 load_dotenv()
 
@@ -76,6 +73,65 @@ def is_missing(val) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Removal tracker
+# ---------------------------------------------------------------------------
+
+class RemovalTracker:
+    """
+    Tracks which TA-Is disappear at each processing step and why.
+
+    Usage:
+        tracker = RemovalTracker(input_tai_set)
+        tracker.snapshot(df, step_number, step_name, detail_fn)
+
+    detail_fn(tai, rows_before_df) -> str  — optional callable that receives
+    the TA-I name and the pre-step slice of the dataframe and returns a
+    human-readable explanation string.  Pass None to use a generic message.
+    """
+
+    def __init__(self, initial_tai_set: set):
+        self._active: set = set(initial_tai_set)          # TA-Is still alive
+        self.removals: dict = {}                           # tai -> removal record
+
+    def snapshot(self, df: pd.DataFrame, step_num: int, step_label: str,
+                 detail_fn=None, pre_step_df: pd.DataFrame = None):
+        """
+        Compare current df against _active.  Any TA-I that has disappeared
+        since the last snapshot is recorded with step_num, step_label, and
+        the output of detail_fn if provided.
+        """
+        if "TA - I" not in df.columns:
+            return
+        current = set(df["TA - I"].dropna().unique())
+        gone = self._active - current
+
+        for tai in gone:
+            detail = ""
+            if detail_fn is not None and pre_step_df is not None:
+                try:
+                    detail = detail_fn(tai, pre_step_df)
+                except Exception:
+                    detail = ""
+            self.removals[tai] = {
+                "step_num":   step_num,
+                "step_label": step_label,
+                "detail":     detail,
+            }
+
+        self._active = current
+
+    def record_manual(self, tai: str, step_num: int, step_label: str, detail: str):
+        """Directly record a removal for a TA-I (used when TA-I column not yet built)."""
+        if tai not in self.removals:
+            self.removals[tai] = {
+                "step_num":   step_num,
+                "step_label": step_label,
+                "detail":     detail,
+            }
+            self._active.discard(tai)
+
+
+# ---------------------------------------------------------------------------
 # Phase ranking
 # ---------------------------------------------------------------------------
 
@@ -95,6 +151,10 @@ def phase_rank(phase_value) -> int:
     return -1
 
 
+def phase_rank_label(rank: int) -> str:
+    return {4: "IV / Approved", 3: "III", 2: "II", 1: "I", -1: "Unknown"}.get(rank, str(rank))
+
+
 # ---------------------------------------------------------------------------
 # Region priority ranking  (Step 8)
 # ---------------------------------------------------------------------------
@@ -107,9 +167,7 @@ _EU_COUNTRY_NAMES = {
     "spain", "sweden",
 }
 
-_TIER2_NAMES = {
-    "canada", "switzerland", "australia", "japan",
-}
+_TIER2_NAMES = {"canada", "switzerland", "australia", "japan"}
 
 
 def region_priority(region_val) -> int:
@@ -129,6 +187,11 @@ def region_priority(region_val) -> int:
     if re.search(r"\b(canada|switzerland|australia|japan)\b", text):
         return 2
     return 3
+
+
+def region_tier_label(priority: int) -> str:
+    return {1: "Tier 1 (US/UK/EU)", 2: "Tier 2 (Canada/Switzerland/Australia/Japan)",
+            3: "Tier 3 (Other)"}.get(priority, "Unknown")
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +399,6 @@ def _fetch_one_nct(nct_id, retries=4, delay=2.0):
         return None
 
     drug_arm_size = _extract_drug_arm_size(study)
-
     locations = protocol.get("contactsLocationsModule", {}).get("locations", [])
     countries = list({loc.get("country", "") for loc in locations if loc.get("country")})
     primary_region = _infer_region(countries)
@@ -489,10 +551,19 @@ def gemini_fallback(trial_ids, api_key, batch_size):
 
 
 # ---------------------------------------------------------------------------
-# Combined fallback
+# Combined fallback  (returns enriched df + per-trial lookup audit)
 # ---------------------------------------------------------------------------
 
 def fill_missing_fields(df, api_key, batch_size):
+    """
+    Returns (df, lookup_audit) where lookup_audit is a dict:
+        trial_id_upper -> {
+            "in_bq": bool,
+            "ctgov_found": bool,
+            "gemini_found": bool,
+            "size_resolved": bool,
+        }
+    """
     target_cols = ["primary_region", "size", "drug_arm_size_n", "dosage"]
     df = df.reset_index(drop=True)
 
@@ -516,6 +587,22 @@ def fill_missing_fields(df, api_key, batch_size):
     print(f"  Total rows : {len(df)}")
     for col in target_cols:
         print(f"  Missing {col:25s}: {df[col].apply(is_missing).sum()} row(s)")
+
+    # Build per-trial audit: start with BQ hit status
+    lookup_audit = {}
+    for _, row in df.iterrows():
+        tid = row["_trial_id_upper"]
+        if not tid or tid in ("", "NAN", "NONE"):
+            continue
+        if tid not in lookup_audit:
+            # "in_bq" = had at least one non-missing value from BQ join
+            # We approximate: if size is not missing after BQ, BQ supplied it
+            lookup_audit[tid] = {
+                "in_bq":         not is_missing(row.get("size")),
+                "ctgov_found":   False,
+                "gemini_found":  False,
+                "size_resolved": not is_missing(row.get("size")),
+            }
 
     missing_per_trial = {}
     for _, row in df.iterrows():
@@ -541,8 +628,9 @@ def fill_missing_fields(df, api_key, batch_size):
     if not unique_trials_needing_fill:
         print("Step 6: No rows with missing fields. Skipping fallback.")
         df = df.drop(columns=["_trial_id_upper"])
-        return df
+        return df, lookup_audit
 
+    # ---- 6a: ClinicalTrials.gov ----
     ctgov_results = clinicaltrials_lookup(unique_trials_needing_fill)
 
     filled_ctgov = 0
@@ -552,6 +640,8 @@ def fill_missing_fields(df, api_key, batch_size):
         entry = ctgov_results.get(tid)
         if not entry:
             continue
+        if tid in lookup_audit:
+            lookup_audit[tid]["ctgov_found"] = True
         for col in target_cols:
             val = entry.get(col)
             if is_missing(df.at[idx, col]) and val is not None:
@@ -566,6 +656,7 @@ def fill_missing_fields(df, api_key, batch_size):
         still_missing = df[col].apply(is_missing).sum()
         print(f"    Missing {col:25s}: {still_missing} row(s)")
 
+    # ---- 6b: Gemini ----
     still_missing_per_trial = {}
     for _, row in df.iterrows():
         if not _needs_fill(row):
@@ -595,6 +686,8 @@ def fill_missing_fields(df, api_key, batch_size):
             entry = gemini_results.get(tid)
             if not entry:
                 continue
+            if tid in lookup_audit:
+                lookup_audit[tid]["gemini_found"] = True
             for col in target_cols:
                 val = entry.get(col)
                 if is_missing(df.at[idx, col]) and val is not None:
@@ -608,12 +701,21 @@ def fill_missing_fields(df, api_key, batch_size):
 
     df = df.drop(columns=["_trial_id_upper"])
 
+    # Update size_resolved status after all fallbacks
+    for _, row in df.iterrows():
+        tid = str(row.get("trial_id", "")).strip().upper()
+        if tid in lookup_audit:
+            lookup_audit[tid]["size_resolved"] = not is_missing(row.get("size"))
+
     print(f"\nStep 6 — Missing field summary (after fallback):")
     print(f"  Total rows : {len(df)}")
     for col in target_cols:
         print(f"  Still missing {col:20s}: {df[col].apply(is_missing).sum()} row(s)")
 
-    still_any_mask = df.apply(_needs_fill, axis=1)
+    def _needs_fill_row(row):
+        return any(is_missing(row.get(col)) for col in target_cols)
+
+    still_any_mask = df.apply(_needs_fill_row, axis=1)
     remaining = (
         df.loc[still_any_mask, ["trial_id"] + target_cols]
         .drop_duplicates("trial_id")
@@ -625,30 +727,63 @@ def fill_missing_fields(df, api_key, batch_size):
             print(f"    {row['trial_id']} — still missing: {gaps}")
 
     print("Step 6 done.")
-    return df
+    return df, lookup_audit
+
+
+# ---------------------------------------------------------------------------
+# Detail functions for the removal tracker
+# ---------------------------------------------------------------------------
+
+def _detail_step7(tai: str, pre_df: pd.DataFrame, lookup_audit: dict) -> str:
+    """
+    Explains why a TA-I was removed in Step 7 (size still empty).
+    Looks at each trial_id for that TA-I and reports what each lookup source returned.
+    """
+    subset = pre_df[pre_df["TA - I"] == tai]
+    trial_ids = subset["trial_id"].dropna().unique().tolist()
+
+    lines = [f"{len(trial_ids)} trial(s) had no resolvable 'size' after all sources:"]
+    for tid in trial_ids:
+        tid_upper = str(tid).strip().upper()
+        audit = lookup_audit.get(tid_upper, {})
+        in_bq       = audit.get("in_bq", False)
+        ctgov_found = audit.get("ctgov_found", False)
+        gemini_found= audit.get("gemini_found", False)
+
+        sources = []
+        sources.append(f"BigQuery: {'found' if in_bq else 'not found'}")
+        if re.match(r"^NCT\d+", tid_upper, re.IGNORECASE):
+            sources.append(f"CT.gov: {'found' if ctgov_found else 'not found / no size returned'}")
+        else:
+            sources.append("CT.gov: skipped (not an NCT ID)")
+        sources.append(f"Gemini: {'found' if gemini_found else 'not found / returned null'}")
+        lines.append(f"  • {tid}: {'; '.join(sources)}")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
 # Step 10 — TA-I Comparison Sheet
 # ---------------------------------------------------------------------------
 
-def add_tai_comparison_sheet(output_path: Path, input_tai_set: set, output_tai_set: set):
+def add_tai_comparison_sheet(
+    output_path: Path,
+    input_tai_set: set,
+    output_tai_set: set,
+    removal_tracker: RemovalTracker,
+):
     """
-    Adds a 'TA-I Comparison' sheet to the already-saved output workbook.
+    Adds a 'TA-I Comparison' sheet.
 
     Columns:
       A  TA-I
-      B  In Input?
-      C  In Output?
-      D  Status        (Retained / Removed / New in Output)
+      B  In Input File?
+      C  In Output File?
+      D  Status          (Retained / Removed / New in Output)
+      E  Removed at Step
+      F  Reason for Removal
 
-    Color coding:
-      Retained  → light green fill
-      Removed   → light red fill
-      New       → light blue fill (TA-I present in output but not in input;
-                  can happen if TA-I was built from cleaned/merged columns)
-
-    A summary block above the table shows counts.
+    Only removed TA-Is populate columns E and F.
     """
     all_tai = sorted(input_tai_set | output_tai_set)
 
@@ -657,13 +792,19 @@ def add_tai_comparison_sheet(output_path: Path, input_tai_set: set, output_tai_s
         in_input  = tai in input_tai_set
         in_output = tai in output_tai_set
         if in_input and in_output:
-            status = "Retained"
+            status, step_label, detail = "Retained", "", ""
         elif in_input and not in_output:
             status = "Removed"
+            rec = removal_tracker.removals.get(tai, {})
+            step_num   = rec.get("step_num", "?")
+            step_lbl   = rec.get("step_label", "Unknown")
+            step_label = f"Step {step_num}: {step_lbl}"
+            detail     = rec.get("detail", "")
         else:
-            status = "New in Output"
+            status, step_label, detail = "New in Output", "", ""
         rows.append((tai, "Yes" if in_input else "No",
-                     "Yes" if in_output else "No", status))
+                     "Yes" if in_output else "No",
+                     status, step_label, detail))
 
     n_retained = sum(1 for r in rows if r[3] == "Retained")
     n_removed  = sum(1 for r in rows if r[3] == "Removed")
@@ -672,169 +813,130 @@ def add_tai_comparison_sheet(output_path: Path, input_tai_set: set, output_tai_s
     # ------------------------------------------------------------------
     # Styles
     # ------------------------------------------------------------------
-    FONT_NAME = "Arial"
+    FN = "Arial"
 
-    # Header row of the table
-    hdr_fill  = PatternFill("solid", fgColor="2F4F8F")   # dark navy
-    hdr_font  = Font(name=FONT_NAME, bold=True, color="FFFFFF", size=11)
+    hdr_fill = PatternFill("solid", fgColor="2F4F8F")
+    hdr_font = Font(name=FN, bold=True, color="FFFFFF", size=11)
 
-    # Title / summary area
-    title_font   = Font(name=FONT_NAME, bold=True, size=13, color="1F3864")
-    label_font   = Font(name=FONT_NAME, bold=True, size=10)
-    value_font   = Font(name=FONT_NAME, size=10)
-    section_font = Font(name=FONT_NAME, bold=True, size=11, color="2F4F8F")
+    title_font  = Font(name=FN, bold=True, size=13, color="1F3864")
+    label_font  = Font(name=FN, bold=True, size=10)
+    value_font  = Font(name=FN, size=10)
 
-    # Status fills (light)
-    fill_retained = PatternFill("solid", fgColor="C6EFCE")   # light green
-    fill_removed  = PatternFill("solid", fgColor="FFC7CE")   # light red
-    fill_new      = PatternFill("solid", fgColor="BDD7EE")   # light blue
+    fill_retained = PatternFill("solid", fgColor="C6EFCE")
+    fill_removed  = PatternFill("solid", fgColor="FFC7CE")
+    fill_new      = PatternFill("solid", fgColor="BDD7EE")
+    fill_alt      = PatternFill("solid", fgColor="F2F2F2")
 
-    # Status text colors
-    font_retained = Font(name=FONT_NAME, size=10, color="276221", bold=True)
-    font_removed  = Font(name=FONT_NAME, size=10, color="9C0006", bold=True)
-    font_new      = Font(name=FONT_NAME, size=10, color="1F4E79", bold=True)
+    font_retained = Font(name=FN, size=10, color="276221", bold=True)
+    font_removed  = Font(name=FN, size=10, color="9C0006", bold=True)
+    font_new      = Font(name=FN, size=10, color="1F4E79", bold=True)
+    body_font     = Font(name=FN, size=10)
+    step_font     = Font(name=FN, size=10, bold=True, color="7F0000")
+    detail_font   = Font(name=FN, size=9,  italic=True, color="404040")
 
-    body_font = Font(name=FONT_NAME, size=10)
+    thin  = Side(style="thin",   color="BFBFBF")
+    thick = Side(style="medium", color="2F4F8F")
+    thin_border  = Border(left=thin,  right=thin,  top=thin,  bottom=thin)
+    thick_top    = Border(left=thin,  right=thin,  top=thick, bottom=thin)
 
-    thin_side   = Side(style="thin",   color="BFBFBF")
-    thick_side  = Side(style="medium", color="2F4F8F")
-    thin_border = Border(left=thin_side, right=thin_side,
-                         top=thin_side,  bottom=thin_side)
-    thick_top   = Border(left=thin_side, right=thin_side,
-                         top=thick_side, bottom=thin_side)
-
-    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    left   = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+    center = Alignment(horizontal="center", vertical="top", wrap_text=True)
+    left   = Alignment(horizontal="left",   vertical="top", wrap_text=True)
 
     # ------------------------------------------------------------------
-    # Open workbook and add sheet
+    # Workbook
     # ------------------------------------------------------------------
     wb = openpyxl.load_workbook(output_path)
-
-    # Remove existing comparison sheet if re-running
     if "TA-I Comparison" in wb.sheetnames:
         del wb["TA-I Comparison"]
-
     ws = wb.create_sheet("TA-I Comparison")
 
-    # ------------------------------------------------------------------
-    # Title  (row 1)
-    # ------------------------------------------------------------------
-    ws.merge_cells("A1:D1")
+    # Title (row 1)
+    ws.merge_cells("A1:F1")
     ws["A1"] = "TA-I Comparison: Input vs Output"
     ws["A1"].font      = title_font
-    ws["A1"].alignment = center
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
     ws["A1"].fill      = PatternFill("solid", fgColor="D9E1F2")
-
     ws.row_dimensions[1].height = 28
 
-    # ------------------------------------------------------------------
-    # Summary block  (rows 2-6)
-    # ------------------------------------------------------------------
+    # Summary block (rows 2–6)
     summary_rows = [
-        ("Input TA-I count",  len(input_tai_set)),
-        ("Output TA-I count", len(output_tai_set)),
-        ("Retained",          n_retained),
-        ("Removed",           n_removed),
-        ("New in Output",     n_new),
+        ("Input TA-I count",  len(input_tai_set), None),
+        ("Output TA-I count", len(output_tai_set), None),
+        ("Retained",          n_retained,  (fill_retained, font_retained)),
+        ("Removed",           n_removed,   (fill_removed,  font_removed)),
+        ("New in Output",     n_new,       (fill_new,      font_new)),
     ]
-
-    for i, (label, val) in enumerate(summary_rows, start=2):
-        ws.cell(row=i, column=1, value=label).font  = label_font
-        ws.cell(row=i, column=1).alignment          = left
-        ws.cell(row=i, column=2, value=val).font    = value_font
-        ws.cell(row=i, column=2).alignment          = center
+    for i, (lbl, val, style) in enumerate(summary_rows, start=2):
+        ws.cell(row=i, column=1, value=lbl).font = label_font
+        ws.cell(row=i, column=1).alignment = Alignment(horizontal="left", vertical="center")
+        c = ws.cell(row=i, column=2, value=val)
+        c.font      = style[1] if style else value_font
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        if style:
+            c.fill = style[0]
         ws.row_dimensions[i].height = 16
 
-    # Colour the summary counts to match the table
-    ws["B4"].fill = fill_retained   # Retained count
-    ws["B4"].font = font_retained
-    ws["B5"].fill = fill_removed    # Removed count
-    ws["B5"].font = font_removed
-    ws["B6"].fill = fill_new        # New count
-    ws["B6"].font = font_new
+    ws.row_dimensions[7].height = 6  # spacer
 
-    # ------------------------------------------------------------------
-    # Blank separator row  (row 7)
-    # ------------------------------------------------------------------
-    ws.row_dimensions[7].height = 6
-
-    # ------------------------------------------------------------------
-    # Table header  (row 8)
-    # ------------------------------------------------------------------
+    # Table header (row 8)
     TABLE_START = 8
-    headers = ["TA-I", "In Input File?", "In Output File?", "Status"]
+    headers = ["TA-I", "In Input File?", "In Output File?",
+               "Status", "Removed at Step", "Reason for Removal"]
+    col_widths = [52, 15, 15, 16, 28, 80]
     for col_idx, h in enumerate(headers, start=1):
-        cell = ws.cell(row=TABLE_START, column=col_idx, value=h)
-        cell.font      = hdr_font
-        cell.fill      = hdr_fill
-        cell.alignment = center
-        cell.border    = thick_top
-    ws.row_dimensions[TABLE_START].height = 20
+        c = ws.cell(row=TABLE_START, column=col_idx, value=h)
+        c.font      = hdr_font
+        c.fill      = hdr_fill
+        c.alignment = center
+        c.border    = thick_top
+    ws.row_dimensions[TABLE_START].height = 22
 
-    # ------------------------------------------------------------------
-    # Data rows  (row 9 onward)
-    # ------------------------------------------------------------------
+    # Data rows
     status_styles = {
         "Retained":      (fill_retained, font_retained),
         "Removed":       (fill_removed,  font_removed),
         "New in Output": (fill_new,      font_new),
     }
 
-    for r_offset, (tai, in_inp, in_out, status) in enumerate(rows, start=1):
-        row_num = TABLE_START + r_offset
-        fill, sfont = status_styles[status]
+    for r_off, (tai, in_inp, in_out, status, step_lbl, detail) in enumerate(rows, start=1):
+        row_num = TABLE_START + r_off
+        sfill, sfont = status_styles[status]
+        use_alt = (r_off % 2 == 0)
 
-        # Alternate row background for readability (only for non-status cells)
-        alt_fill = PatternFill("solid", fgColor="F2F2F2") if r_offset % 2 == 0 else None
+        def _cell(col, value, font=body_font, align=left, fill=None, border=thin_border):
+            c = ws.cell(row=row_num, column=col, value=value)
+            c.font      = font
+            c.alignment = align
+            c.border    = border
+            if fill:
+                c.fill = fill
+            elif use_alt and status != "Removed":
+                c.fill = fill_alt
+            return c
 
-        # Col A: TA-I name
-        c = ws.cell(row=row_num, column=1, value=tai)
-        c.font      = body_font
-        c.alignment = left
-        c.border    = thin_border
-        if alt_fill:
-            c.fill = alt_fill
+        _cell(1, tai)
+        _cell(2, in_inp, align=center)
+        _cell(3, in_out, align=center)
+        _cell(4, status, font=sfont, fill=sfill, align=center)
 
-        # Col B: In Input?
-        c = ws.cell(row=row_num, column=2, value=in_inp)
-        c.font      = body_font
-        c.alignment = center
-        c.border    = thin_border
-        if alt_fill:
-            c.fill = alt_fill
+        if status == "Removed":
+            _cell(5, step_lbl,  font=step_font,   fill=PatternFill("solid", fgColor="FFE4E1"))
+            _cell(6, detail,    font=detail_font,  fill=PatternFill("solid", fgColor="FFF5F5"))
+        else:
+            _cell(5, "—", align=center)
+            _cell(6, "—", align=center)
 
-        # Col C: In Output?
-        c = ws.cell(row=row_num, column=3, value=in_out)
-        c.font      = body_font
-        c.alignment = center
-        c.border    = thin_border
-        if alt_fill:
-            c.fill = alt_fill
+        # Row height: taller for removed rows (detail can be multi-line)
+        ws.row_dimensions[row_num].height = 60 if status == "Removed" else 18
 
-        # Col D: Status  (always coloured by status)
-        c = ws.cell(row=row_num, column=4, value=status)
-        c.font      = sfont
-        c.fill      = fill
-        c.alignment = center
-        c.border    = thin_border
-
-        ws.row_dimensions[row_num].height = 18
-
-    # ------------------------------------------------------------------
     # Column widths
-    # ------------------------------------------------------------------
-    ws.column_dimensions["A"].width = 55   # TA-I names can be long
-    ws.column_dimensions["B"].width = 16
-    ws.column_dimensions["C"].width = 16
-    ws.column_dimensions["D"].width = 18
+    for col_idx, width in enumerate(col_widths, start=1):
+        ws.column_dimensions[chr(64 + col_idx)].width = width
 
-    # ------------------------------------------------------------------
-    # Freeze panes below header
-    # ------------------------------------------------------------------
     ws.freeze_panes = f"A{TABLE_START + 1}"
 
     wb.save(output_path)
+
     print(f"\nStep 10 done: 'TA-I Comparison' sheet added.")
     print(f"  Input TA-Is : {len(input_tai_set)}")
     print(f"  Output TA-Is: {len(output_tai_set)}")
@@ -842,10 +944,10 @@ def add_tai_comparison_sheet(output_path: Path, input_tai_set: set, output_tai_s
     print(f"  Removed     : {n_removed}")
     print(f"  New         : {n_new}")
     if n_removed:
-        removed_list = sorted(r[0] for r in rows if r[3] == "Removed")
         print("  Removed TA-Is:")
-        for t in removed_list:
-            print(f"    - {t}")
+        for r in rows:
+            if r[3] == "Removed":
+                print(f"    - {r[0]}  [{r[4]}]")
 
 
 # ---------------------------------------------------------------------------
@@ -896,21 +998,22 @@ def process():
     df = pd.read_excel(input_path)
 
     # -----------------------------------------------------------------------
-    # Capture input TA-I set BEFORE any processing.
-    # Build it the same way Step 2 does so the comparison is apples-to-apples.
+    # Capture input TA-I set BEFORE any processing
     # -----------------------------------------------------------------------
     input_tai_set: set = set()
     if "therapy_area" in df.columns and "ot_disease_name" in df.columns:
         input_tai_set = set(
             (df["therapy_area"].astype(str) + " - " + df["ot_disease_name"].astype(str))
-            .dropna()
-            .unique()
+            .dropna().unique()
         )
     elif "TA - I" in df.columns:
-        # If the column already exists in the input file, use it directly
         input_tai_set = set(df["TA - I"].dropna().unique())
 
-    # 1. Clean trial_id
+    tracker = RemovalTracker(input_tai_set)
+
+    # -----------------------------------------------------------------------
+    # Step 1: Clean trial_id
+    # -----------------------------------------------------------------------
     if "trial_id" not in df.columns:
         print("WARNING: 'trial_id' not found. Skipping step 1.")
     else:
@@ -921,7 +1024,9 @@ def process():
         )
         print("Step 1 done: trial_id cleaned.")
 
-    # 2. Add TA - I
+    # -----------------------------------------------------------------------
+    # Step 2: Add TA - I
+    # -----------------------------------------------------------------------
     missing_cols = [c for c in ("therapy_area", "ot_disease_name") if c not in df.columns]
     if missing_cols:
         print(f"WARNING: {missing_cols} not found. Skipping steps 2-4.")
@@ -929,34 +1034,51 @@ def process():
         df["TA - I"] = df["therapy_area"].astype(str) + " - " + df["ot_disease_name"].astype(str)
         print("Step 2 done: 'TA - I' column added.")
 
-        # 3. Deduplicate by highest phase
+        # -----------------------------------------------------------------------
+        # Step 3: Deduplicate by highest phase
+        # -----------------------------------------------------------------------
         if "phase" not in df.columns:
             print("WARNING: 'phase' not found. Skipping step 3.")
         else:
             df["_phase_rank"] = df["phase"].apply(phase_rank)
             df["_max_rank"]   = df.groupby("TA - I")["_phase_rank"].transform("max")
             before = len(df)
+            pre_step3 = df.copy()
             df = df[df["_phase_rank"] == df["_max_rank"]].sort_index()
             df = df.drop(columns=["_phase_rank", "_max_rank"])
             print(f"Step 3 done: {before - len(df)} lower-phase row(s) removed.")
+            # Step 3 cannot fully remove a TA-I (all ranks equal → all kept), but
+            # snapshot anyway for safety
+            tracker.snapshot(df, 3, "Phase deduplication", pre_step_df=pre_step3)
 
-        # 4. Deduplicate (TA - I, trial_id)
+        # -----------------------------------------------------------------------
+        # Step 4: Deduplicate (TA - I, trial_id)
+        # -----------------------------------------------------------------------
         if "trial_id" in df.columns:
             before = len(df)
+            pre_step4 = df.copy()
             df = df.drop_duplicates(subset=["TA - I", "trial_id"], keep="first").sort_index()
             print(f"Step 4 done: {before - len(df)} duplicate (TA-I, trial_id) row(s) removed.")
+            tracker.snapshot(df, 4, "Deduplication on (TA-I, trial_id)", pre_step_df=pre_step4)
 
-    # 5. BQ join
+    # -----------------------------------------------------------------------
+    # Step 5: BQ join
+    # -----------------------------------------------------------------------
+    lookup_audit = {}   # populated by fill_missing_fields
+
     if "trial_id" not in df.columns:
         print("WARNING: 'trial_id' not found. Skipping BQ join.")
     else:
         bq_df = fetch_bq_data(project_id, dataset_id, bq_table)
         bq_df["trial_id"] = bq_df["trial_id"].astype(str).str.strip()
 
-        bq_cols = ["trial_id", "primary_region", "secondary_countries", "size", "drug_arm_size_n", "dosage"]
+        bq_cols = ["trial_id", "primary_region", "secondary_countries",
+                   "size", "drug_arm_size_n", "dosage"]
 
         bq_df = bq_df[bq_cols].copy()
-        bq_df["_non_null_count"] = bq_df[["primary_region", "secondary_countries", "size", "drug_arm_size_n", "dosage"]].notna().sum(axis=1)
+        bq_df["_non_null_count"] = bq_df[
+            ["primary_region", "secondary_countries", "size", "drug_arm_size_n", "dosage"]
+        ].notna().sum(axis=1)
         bq_df = (
             bq_df.sort_values("_non_null_count", ascending=False)
                  .drop_duplicates(subset=["trial_id"], keep="first")
@@ -983,26 +1105,42 @@ def process():
         for col in ["primary_region", "size", "drug_arm_size_n", "dosage"]:
             missing_tids = df.loc[df[col].apply(is_missing), "trial_id"].unique()
             if len(missing_tids) > 0:
-                print(f"    {col}: {len(missing_tids)} unique trial(s) — {list(missing_tids[:10])}{'...' if len(missing_tids) > 10 else ''}")
+                print(f"    {col}: {len(missing_tids)} unique trial(s) — "
+                      f"{list(missing_tids[:10])}{'...' if len(missing_tids) > 10 else ''}")
 
-    # 6. Fill all missing fields
+    # -----------------------------------------------------------------------
+    # Step 6: Fill missing fields
+    # -----------------------------------------------------------------------
     if "trial_id" in df.columns:
-        df = fill_missing_fields(df, gemini_api_key, batch_size)
+        df, lookup_audit = fill_missing_fields(df, gemini_api_key, batch_size)
 
-    # 7. Drop rows where size is still empty
+    # -----------------------------------------------------------------------
+    # Step 7: Drop rows where size is still empty
+    # -----------------------------------------------------------------------
     if "size" in df.columns:
         before = len(df)
+        pre_step7 = df.copy()
+
+        def _detail7(tai, pre_df):
+            return _detail_step7(tai, pre_df, lookup_audit)
+
         df = df[~df["size"].apply(is_missing)].reset_index(drop=True)
         dropped = before - len(df)
         print(f"\nStep 7 done: {dropped} row(s) dropped because size is still empty. "
               f"Remaining rows: {len(df)}")
+        tracker.snapshot(df, 7, "Size still empty after all fallbacks",
+                         detail_fn=_detail7, pre_step_df=pre_step7)
     else:
         print("\nStep 7: 'size' column not found — skipping row drop.")
 
-    # 8. Region-priority filter
+    # -----------------------------------------------------------------------
+    # Step 8: Region-priority filter
+    # -----------------------------------------------------------------------
     required_cols_8 = {"TA - I", "phase", "primary_region"}
     if required_cols_8.issubset(df.columns):
         before = len(df)
+        pre_step8 = df.copy()
+
         df["_region_priority"] = df["primary_region"].apply(region_priority)
         df["_best_region_priority"] = df.groupby(
             ["TA - I", "phase"], sort=False
@@ -1011,16 +1149,21 @@ def process():
         df = df.drop(columns=["_region_priority", "_best_region_priority"])
         print(f"\nStep 8 done: {before - len(df)} row(s) removed by region-priority filter. "
               f"Remaining rows: {len(df)}")
-        print("  Region hierarchy applied: "
-              "Tier 1 (US/UK/EU) > Tier 2 (Canada/Switzerland/Australia/Japan) > Tier 3 (other)")
+
+        # Step 8 cannot fully remove a TA-I (worst case keeps all Tier-3), but snapshot anyway
+        tracker.snapshot(df, 8, "Region-priority filter", pre_step_df=pre_step8)
     else:
         missing = required_cols_8 - set(df.columns)
         print(f"\nStep 8 skipped: missing column(s) {missing}.")
 
-    # 9. Max-size filter
+    # -----------------------------------------------------------------------
+    # Step 9: Max-size filter
+    # -----------------------------------------------------------------------
     required_cols_9 = {"TA - I", "phase", "primary_region", "size"}
     if required_cols_9.issubset(df.columns):
         before = len(df)
+        pre_step9 = df.copy()
+
         df["_size_numeric"] = pd.to_numeric(df["size"], errors="coerce").fillna(0)
         df["_max_size"] = df.groupby(
             ["TA - I", "phase", "primary_region"], sort=False
@@ -1030,6 +1173,7 @@ def process():
         df = df.drop(columns=["_size_numeric", "_max_size"]).reset_index(drop=True)
         print(f"\nStep 9 done: {before - len(df)} row(s) removed by max-size filter. "
               f"Remaining rows: {len(df)}")
+        tracker.snapshot(df, 9, "Max-size deduplication", pre_step_df=pre_step9)
     else:
         missing = required_cols_9 - set(df.columns)
         print(f"\nStep 9 skipped: missing column(s) {missing}.")
@@ -1042,13 +1186,13 @@ def process():
     print(f"\nOutput saved: {output_path}")
 
     # -----------------------------------------------------------------------
-    # 10. Add TA-I Comparison sheet
+    # Step 10: Add TA-I Comparison sheet with removal reasons
     # -----------------------------------------------------------------------
     output_tai_set: set = set()
     if "TA - I" in df.columns:
         output_tai_set = set(df["TA - I"].dropna().unique())
 
-    add_tai_comparison_sheet(output_path, input_tai_set, output_tai_set)
+    add_tai_comparison_sheet(output_path, input_tai_set, output_tai_set, tracker)
     print(f"\nDone. Final output: {output_path}")
 
 
