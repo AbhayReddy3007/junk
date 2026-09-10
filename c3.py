@@ -156,6 +156,33 @@ def phase_rank_label(rank: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Lookup cache  (persists CT.gov + Gemini results across runs)
+# ---------------------------------------------------------------------------
+
+def _load_cache(cache_path: Path) -> dict:
+    """Load the JSON lookup cache, returning {} if missing or corrupt."""
+    if cache_path.exists():
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                print(f"  Loaded {len(data)} cached trial(s) from {cache_path}")
+                return data
+        except Exception as e:
+            print(f"  WARNING: Could not read cache {cache_path}: {e}")
+    return {}
+
+
+def _save_cache(cache_path: Path, cache: dict):
+    """Persist the lookup cache to disk."""
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2, default=str)
+    except Exception as e:
+        print(f"  WARNING: Could not write cache {cache_path}: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Region priority ranking  (Step 8)
 # ---------------------------------------------------------------------------
 
@@ -554,7 +581,7 @@ def gemini_fallback(trial_ids, api_key, batch_size):
 # Combined fallback  (returns enriched df + per-trial lookup audit)
 # ---------------------------------------------------------------------------
 
-def fill_missing_fields(df, api_key, batch_size):
+def fill_missing_fields(df, api_key, batch_size, cache_path: Path = None):
     """
     Returns (df, lookup_audit) where lookup_audit is a dict:
         trial_id_upper -> {
@@ -578,19 +605,24 @@ def fill_missing_fields(df, api_key, batch_size):
     if "primary_region" in df.columns:
         df["primary_region"] = df["primary_region"].astype(object)
 
-    # Rows where data_source != "Clinical Trials": set size/drug_arm_size_n/dosage = 0
-    # and exclude them from all external lookups (CT.gov / Gemini).
-    _size_cols = ["size", "drug_arm_size_n", "dosage"]
+    # Rows where data_source != "Clinical Trials":
+    # set size / drug_arm_size_n / dosage / phase to None and skip all lookups.
+    _ct_fill_cols = ["size", "drug_arm_size_n", "dosage", "phase"]
     if "data_source" in df.columns:
         non_ct_mask = df["data_source"].astype(str).str.strip().str.lower() != "clinical trials"
-        for col in _size_cols:
-            df.loc[non_ct_mask, col] = 0
+        for col in _ct_fill_cols:
+            if col not in df.columns:
+                df[col] = None
+            df.loc[non_ct_mask, col] = None
         n_non_ct = non_ct_mask.sum()
         if n_non_ct:
             print(f"  {n_non_ct} row(s) with data_source != 'Clinical Trials': "
-                  f"size/drug_arm_size_n/dosage set to 0, skipped from lookup.")
+                  f"size/drug_arm_size_n/dosage/phase set to NA, skipped from lookup.")
     else:
         non_ct_mask = pd.Series(False, index=df.index)
+
+    # Load the persistent lookup cache (CT.gov + Gemini results from prior runs).
+    cache = _load_cache(cache_path) if cache_path else {}
 
     df["_trial_id_upper"] = df["trial_id"].astype(str).str.strip().str.upper()
 
@@ -647,6 +679,36 @@ def fill_missing_fields(df, api_key, batch_size):
         df = df.drop(columns=["_trial_id_upper"])
         return df, lookup_audit
 
+    # ---- Apply cache from previous runs ----
+    cache_filled = 0
+    cache_fill_detail = {}
+    still_needing_fill = []
+    for tid in unique_trials_needing_fill:
+        cached = cache.get(tid)
+        if cached:
+            for idx in df.index[df["_trial_id_upper"] == tid]:
+                for col in target_cols:
+                    val = cached.get(col)
+                    if is_missing(df.at[idx, col]) and val is not None:
+                        df.at[idx, col] = val
+                        cache_filled += 1
+                        cache_fill_detail.setdefault(col, 0)
+                        cache_fill_detail[col] += 1
+            if tid in lookup_audit:
+                lookup_audit[tid]["ctgov_found"]  = cached.get("_ctgov_found",  False)
+                lookup_audit[tid]["gemini_found"] = cached.get("_gemini_found", False)
+        else:
+            still_needing_fill.append(tid)
+
+    if cache_filled:
+        print(f"  Cache filled {cache_filled} cell(s): {cache_fill_detail}")
+    unique_trials_needing_fill = still_needing_fill
+
+    if not unique_trials_needing_fill:
+        print("Step 6: All missing fields resolved from cache. Skipping API calls.")
+        df = df.drop(columns=["_trial_id_upper"])
+        return df, lookup_audit
+
     # ---- 6a: ClinicalTrials.gov ----
     ctgov_results = clinicaltrials_lookup(unique_trials_needing_fill)
 
@@ -667,6 +729,14 @@ def fill_missing_fields(df, api_key, batch_size):
                 fill_detail.setdefault(col, 0)
                 fill_detail[col] += 1
     print(f"  CT.gov filled {filled_ctgov} cell(s): {fill_detail}")
+
+    # Persist CT.gov results to cache
+    for tid, entry in ctgov_results.items():
+        cache.setdefault(tid, {}).update(entry)
+        cache[tid]["_ctgov_found"] = True
+        if lookup_audit.get(tid, {}).get("ctgov_found"):
+            cache[tid]["_ctgov_found"] = True
+    _save_cache(cache_path, cache)
 
     print(f"  Verification after CT.gov fill:")
     for col in target_cols:
@@ -713,6 +783,12 @@ def fill_missing_fields(df, api_key, batch_size):
                     fill_detail_g.setdefault(col, 0)
                     fill_detail_g[col] += 1
         print(f"  Gemini filled {filled_gemini} cell(s): {fill_detail_g}")
+
+        # Persist Gemini results to cache
+        for tid, entry in gemini_results.items():
+            cache.setdefault(tid, {}).update(entry)
+            cache[tid]["_gemini_found"] = True
+        _save_cache(cache_path, cache)
     else:
         print("  All fields resolved by CT.gov. Gemini not needed.")
 
@@ -1009,8 +1085,10 @@ def process():
         sys.exit(1)
 
     output_path = input_path.with_name(input_path.stem + "_processed.xlsx")
+    cache_path  = input_path.with_name(input_path.stem + "_lookup_cache.json")
     print(f"Input file  : {input_path}")
     print(f"Output file : {output_path}")
+    print(f"Cache file  : {cache_path}")
 
     df = pd.read_excel(input_path)
 
@@ -1129,7 +1207,7 @@ def process():
     # Step 6: Fill missing fields
     # -----------------------------------------------------------------------
     if "trial_id" in df.columns:
-        df, lookup_audit = fill_missing_fields(df, gemini_api_key, batch_size)
+        df, lookup_audit = fill_missing_fields(df, gemini_api_key, batch_size, cache_path=cache_path)
 
     # -----------------------------------------------------------------------
     # Step 7: Set size = 0 where size is still empty (retain rows)
