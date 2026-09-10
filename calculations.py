@@ -801,7 +801,7 @@ def add_indication_breadth(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     # x = unique disease count; N_eff_ind = single repeated value
-    x         = df["ot_disease_name"].nunique()
+    x         = df["effective_indications"].iloc[0]
     n_eff_ind = df["effective_indications"].iloc[0]
 
     # Anchor and derived values
@@ -900,7 +900,7 @@ def add_therapy_area_breadth(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     # x = unique therapy area count; N_eff_ta = single repeated value
-    x        = df["therapy_area"].nunique()
+    x        = df["effective_therapy_areas"].iloc[0]
     n_eff_ta = df["effective_therapy_areas"].iloc[0]
 
     # Anchor and derived values
