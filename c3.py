@@ -16,8 +16,8 @@ Excel Processing Script
        Tier 1 (highest): United States / US / UK / Europe / EU and full EU country names
        Tier 2          : Canada, Switzerland, Australia, Japan
        Tier 3 (lowest) : any other region / country
-9. Within each (TA - I, phase, primary_region) group, retains only the row
-   with the highest size value.
+9. Retains exactly one row per TA - I: the row with the highest size.
+   Tiebreaker: highest phase. If phase is also tied, the first row is kept.
 10. Adds a 'TA-I Comparison' sheet showing which TA-Is were retained or removed,
     the step that caused removal, and a plain-English explanation of why.
 
@@ -578,9 +578,26 @@ def fill_missing_fields(df, api_key, batch_size):
     if "primary_region" in df.columns:
         df["primary_region"] = df["primary_region"].astype(object)
 
+    # Rows where data_source != "Clinical Trials": set size/drug_arm_size_n/dosage = 0
+    # and exclude them from all external lookups (CT.gov / Gemini).
+    _size_cols = ["size", "drug_arm_size_n", "dosage"]
+    if "data_source" in df.columns:
+        non_ct_mask = df["data_source"].astype(str).str.strip().str.lower() != "clinical trials"
+        for col in _size_cols:
+            df.loc[non_ct_mask, col] = 0
+        n_non_ct = non_ct_mask.sum()
+        if n_non_ct:
+            print(f"  {n_non_ct} row(s) with data_source != 'Clinical Trials': "
+                  f"size/drug_arm_size_n/dosage set to 0, skipped from lookup.")
+    else:
+        non_ct_mask = pd.Series(False, index=df.index)
+
     df["_trial_id_upper"] = df["trial_id"].astype(str).str.strip().str.upper()
 
     def _needs_fill(row):
+        # Never fetch for non-Clinical-Trials rows
+        if non_ct_mask.loc[row.name]:
+            return False
         return any(is_missing(row.get(col)) for col in target_cols)
 
     print(f"\nStep 6 — Missing field summary (before fallback):")
@@ -1157,32 +1174,22 @@ def process():
         before = len(df)
         pre_step9 = df.copy()
 
+        # Goal: exactly one row per TA-I.
+        # Tiebreaker order: 1) highest size  2) highest phase  3) first row.
         df["_size_numeric"] = pd.to_numeric(df["size"], errors="coerce").fillna(0)
-        df["_max_size"] = df.groupby(
-            ["TA - I", "phase", "primary_region"], sort=False
-        )["_size_numeric"].transform("max")
+        df["_phase_rank"]   = df["phase"].apply(phase_rank)
 
-        # Rows where the whole group has size 0 — fall back to highest-phase selection
-        all_zero_mask = df["_max_size"] == 0
-        normal_mask   = ~all_zero_mask
+        # Sort so that for each TA-I the best row comes first, then keep it.
+        df = (
+            df.sort_values(
+                ["TA - I", "_size_numeric", "_phase_rank"],
+                ascending=[True, False, False],
+            )
+            .drop_duplicates(subset=["TA - I"], keep="first")
+            .drop(columns=["_size_numeric", "_phase_rank"])
+            .reset_index(drop=True)
+        )
 
-        # Normal path: keep rows matching the max size in their group
-        df_normal = df[normal_mask & (df["_size_numeric"] == df["_max_size"])]
-        df_normal = df_normal.drop_duplicates(subset=["TA - I", "phase", "primary_region"], keep="first")
-
-        # Zero-size path: keep the row with the highest phase rank per (TA-I, primary_region)
-        df_zero = df[all_zero_mask].copy()
-        if not df_zero.empty:
-            df_zero["_phase_rank_tmp"] = df_zero["phase"].apply(phase_rank)
-            df_zero["_max_phase_tmp"] = df_zero.groupby(
-                ["TA - I", "primary_region"], sort=False
-            )["_phase_rank_tmp"].transform("max")
-            df_zero = df_zero[df_zero["_phase_rank_tmp"] == df_zero["_max_phase_tmp"]]
-            df_zero = df_zero.drop_duplicates(subset=["TA - I", "primary_region"], keep="first")
-            df_zero = df_zero.drop(columns=["_phase_rank_tmp", "_max_phase_tmp"])
-
-        df = pd.concat([df_normal, df_zero], ignore_index=True)
-        df = df.drop(columns=["_size_numeric", "_max_size"]).reset_index(drop=True)
         print(f"\nStep 9 done: {before - len(df)} row(s) removed by max-size filter. "
               f"Remaining rows: {len(df)}")
         tracker.snapshot(df, 9, "Max-size deduplication", pre_step_df=pre_step9)
