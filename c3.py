@@ -1161,8 +1161,27 @@ def process():
         df["_max_size"] = df.groupby(
             ["TA - I", "phase", "primary_region"], sort=False
         )["_size_numeric"].transform("max")
-        df = df[df["_size_numeric"] == df["_max_size"]]
-        df = df.drop_duplicates(subset=["TA - I", "phase", "primary_region"], keep="first")
+
+        # Rows where the whole group has size 0 — fall back to highest-phase selection
+        all_zero_mask = df["_max_size"] == 0
+        normal_mask   = ~all_zero_mask
+
+        # Normal path: keep rows matching the max size in their group
+        df_normal = df[normal_mask & (df["_size_numeric"] == df["_max_size"])]
+        df_normal = df_normal.drop_duplicates(subset=["TA - I", "phase", "primary_region"], keep="first")
+
+        # Zero-size path: keep the row with the highest phase rank per (TA-I, primary_region)
+        df_zero = df[all_zero_mask].copy()
+        if not df_zero.empty:
+            df_zero["_phase_rank_tmp"] = df_zero["phase"].apply(phase_rank)
+            df_zero["_max_phase_tmp"] = df_zero.groupby(
+                ["TA - I", "primary_region"], sort=False
+            )["_phase_rank_tmp"].transform("max")
+            df_zero = df_zero[df_zero["_phase_rank_tmp"] == df_zero["_max_phase_tmp"]]
+            df_zero = df_zero.drop_duplicates(subset=["TA - I", "primary_region"], keep="first")
+            df_zero = df_zero.drop(columns=["_phase_rank_tmp", "_max_phase_tmp"])
+
+        df = pd.concat([df_normal, df_zero], ignore_index=True)
         df = df.drop(columns=["_size_numeric", "_max_size"]).reset_index(drop=True)
         print(f"\nStep 9 done: {before - len(df)} row(s) removed by max-size filter. "
               f"Remaining rows: {len(df)}")
