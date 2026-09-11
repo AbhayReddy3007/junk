@@ -74,10 +74,13 @@ Non-clinical-trial override
 -----------------------------
     Column: data_source
     If data_source != "Clinical Trials" (case-insensitive, trimmed; also
-    applies to missing/blank data_source), then w_geo, w_dose, and w_sample
-    are all forced to 1.00 for that row, overriding whatever values steps
-    4-6 computed. This runs AFTER steps 4, 5, 6 and BEFORE Q_i (step 7),
-    so Q_i is computed from the overridden values.
+    applies to missing/blank data_source), then for that row:
+      - w_geo, w_dose, and w_sample are all forced to 1.00
+        (runs AFTER steps 4, 5, 6 and BEFORE Q_i / step 7, so Q_i is
+        computed from the overridden values)
+      - e_phase_i is forced to 0.05
+        (runs AFTER step 8b / add_e_phase_i and BEFORE e_i / step 8, so
+        e_i is computed from the overridden value)
 
 Usage:
     python calculations.py
@@ -500,6 +503,30 @@ def add_w_sample(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ---------------------------------------------------------------------------
+# Shared helper: identifies which rows are NOT from 'Clinical Trials'
+# ---------------------------------------------------------------------------
+
+def _non_clinical_trial_mask(df: pd.DataFrame):
+    """
+    Return a boolean Series that is True for rows where data_source is not
+    'Clinical Trials' (case-insensitive, trimmed). Missing/blank data_source
+    is also treated as NOT 'Clinical Trials'.
+
+    Returns None if the 'data_source' column doesn't exist.
+    """
+    if "data_source" not in df.columns:
+        return None
+
+    def _is_clinical_trials(val) -> bool:
+        if _is_missing(val):
+            return False
+        return str(val).strip().lower() == "clinical trials"
+
+    is_ct = df["data_source"].apply(_is_clinical_trials)
+    return ~is_ct
+
+
 # ===========================================================================
 # 6b. Non-clinical-trial overrides for w_geo, w_dose, w_sample
 # ===========================================================================
@@ -524,25 +551,55 @@ def add_non_ct_overrides(df: pd.DataFrame) -> pd.DataFrame:
             "Ensure steps 4, 5, and 6 have run."
         )
 
-    if "data_source" not in df.columns:
+    non_ct_mask = _non_clinical_trial_mask(df)
+    if non_ct_mask is None:
         print(
             "WARNING: 'data_source' column not found. "
             "No non-clinical-trial overrides applied."
         )
         return df
 
-    def _is_clinical_trials(val) -> bool:
-        if _is_missing(val):
-            return False
-        return str(val).strip().lower() == "clinical trials"
-
-    is_ct = df["data_source"].apply(_is_clinical_trials)
-    non_ct_mask = ~is_ct
-
     df.loc[non_ct_mask, ["w_geo", "w_dose", "w_sample"]] = 1.00
 
     print(
-        f"  [6b] Non-clinical-trial overrides applied.  "
+        f"  [6b] Non-clinical-trial overrides applied (w_geo/w_dose/w_sample).  "
+        f"Rows overridden (data_source != 'Clinical Trials'): {non_ct_mask.sum()} / {len(df)}"
+    )
+    return df
+
+
+# ===========================================================================
+# 8c. Non-clinical-trial override for e_phase_i
+# ===========================================================================
+
+def add_non_ct_e_phase_override(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Override e_phase_i to 0.05 for any row where data_source is not
+    'Clinical Trials'. Same matching rules as add_non_ct_overrides
+    (case-insensitive/trimmed; missing/blank data_source counts as non-CT).
+
+    Requires 'e_phase_i' to already exist (step 8b / add_e_phase_i).
+    Must run AFTER add_e_phase_i and BEFORE add_e_i (step 8), so e_i is
+    computed using the overridden e_phase_i value.
+    """
+    if "e_phase_i" not in df.columns:
+        raise ValueError(
+            "'add_non_ct_e_phase_override' requires 'e_phase_i'. "
+            "Ensure step 8b (add_e_phase_i) has run."
+        )
+
+    non_ct_mask = _non_clinical_trial_mask(df)
+    if non_ct_mask is None:
+        print(
+            "WARNING: 'data_source' column not found. "
+            "No non-clinical-trial e_phase_i override applied."
+        )
+        return df
+
+    df.loc[non_ct_mask, "e_phase_i"] = 0.05
+
+    print(
+        f"  [8c] Non-clinical-trial override applied (e_phase_i = 0.05).  "
         f"Rows overridden (data_source != 'Clinical Trials'): {non_ct_mask.sum()} / {len(df)}"
     )
     return df
@@ -1195,6 +1252,7 @@ def run_calculations(input_path: Path) -> Path:
     df = add_non_ct_overrides(df)                # 6b
     df = add_Q_i(df)                             # 7
     df = add_e_phase_i(df)                       # 8b
+    df = add_non_ct_e_phase_override(df)         # 8c
     df = add_e_i(df)                             # 8  (depends on e_phase_i)
     df = add_link(df)                            # 9
     df = add_link_ta(df)                         # 10
