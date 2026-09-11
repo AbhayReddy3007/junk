@@ -1,0 +1,1229 @@
+"""
+calculations.py
+---------------
+Takes the output of excel_processing_script.py (a *_processed.xlsx file) and
+adds the following derived columns, one function per calculation:
+
+    1.  prior                    – based on association_score
+    2.  maturity_weight          – based on phase
+    3.  effective_indications    – drug-level sum of maturity_weight
+        effective_therapy_areas  – sum of per-therapy-area mean of maturity_weight
+    4.  w_geo                    – geographic weight from primary_region tier
+    5.  w_dose                   – dosage-rank weight within (drug, dosage) groups
+    6.  w_sample                 – sample-size weight from drug_arm_size_n
+    6b. Non-clinical-trial override – forces w_geo, w_dose, w_sample to 1.00
+                                   for rows where data_source != 'Clinical Trials'
+    7.  Q_i                      – w_geo × w_sample × w_dose
+    8.  e_i                      – Q_i × e_phase_i
+    8b. e_phase_i                – phase × association bucket lookup
+    9.  Link                     – 1 - (1 - prior) × (1 - e_i)
+    10. Link_TA                  – average of Link across all rows sharing the
+                                   same therapy_area
+    11. L_ind                    – logistic transformation of N_eff_ind
+        B_raw_ind                  raw normalised indication breadth
+        B_ind                      final normalised indication breadth score
+                                   (all three are dataset-level constants
+                                    broadcast to every row)
+    12. L_TA                     – logistic transformation of unique therapy_area count
+        B_raw_TA                   raw normalised therapy-area breadth
+        B_TA                       final normalised therapy-area breadth score
+                                   (all three are dataset-level constants
+                                    broadcast to every row)
+    13. B                        – B_ind × B_TA
+    14. Overall Coherence        – weighted coherence score across therapy areas
+    15. C                        – 0.1 + 0.9 × (Overall Coherence)^1.75
+    16. Final Score              – 1 + 4 × B × C
+        B_raw_TA                   raw normalised therapy-area breadth
+        B_TA                       final normalised therapy-area breadth score
+                                   (all three are dataset-level constants
+                                    broadcast to every row)
+
+e_phase_i lookup table
+-----------------------
+    Association bucket is determined by association_score:
+      > 0.40            → Obvious
+      0.10 <= x <= 0.40 → Indirect
+      < 0.10            → Novel
+
+    +-----------+---------+----------+-------+
+    | Phase     | Obvious | Indirect | Novel |
+    +-----------+---------+----------+-------+
+    | Phase 1   |  0.10   |  0.10    |  0.10 |
+    | Phase 2   |  0.40   |  0.35    |  0.30 |
+    | Phase 3   |  0.80   |  0.65    |  0.55 |
+    | Approved  |  1.00   |  1.00    |  1.00 |
+    +-----------+---------+----------+-------+
+
+    Rows where phase is missing or unrecognised receive NaN.
+    Rows where association_score is missing are treated as Novel.
+
+Indication-breadth constants
+-----------------------------
+    N0   = 9      (inflection point of logistic curve)
+    a    = 0.40   (steepness parameter)
+
+    L_ind(x)      = 1 / (1 + exp(-a * (x - N0)))
+    B_raw_ind(x)  = (L_ind(x) - L_ind(0)) / (1 - L_ind(0))
+    N_eff_ind     = sum of the effective_indications column across all rows
+    B_ind         = min(1, B_raw_ind(N_eff_ind) / B_raw_ind(15))
+
+    All three values are scalars computed once and stored identically in
+    every row of the output.
+
+Non-clinical-trial override
+-----------------------------
+    Column: data_source
+    If data_source != "Clinical Trials" (case-insensitive, trimmed; also
+    applies to missing/blank data_source), then w_geo, w_dose, and w_sample
+    are all forced to 1.00 for that row, overriding whatever values steps
+    4-6 computed. This runs AFTER steps 4, 5, 6 and BEFORE Q_i (step 7),
+    so Q_i is computed from the overridden values.
+
+Usage:
+    python calculations.py
+
+    The input file path is read from the FILE variable in the .env file
+    located in the working directory.
+
+Output:
+    <stem>_calculated.xlsx  written alongside the input file.
+
+.env variable required:
+    FILE  - Path to the *_processed.xlsx file produced by excel_processing_script.py
+
+The script identifies the "drug" column automatically, trying these names in
+order: drug_name, drug, compound_name, molecule_name, generic_name.
+If none match, the first column of the file is used as a fallback and a
+warning is printed.
+"""
+
+import math
+import os
+import re
+import sys
+from pathlib import Path
+
+import pandas as pd
+from dotenv import load_dotenv
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared across calculations
+# ---------------------------------------------------------------------------
+
+def _is_missing(val) -> bool:
+    """Return True for None, NaN, pd.NA, empty / whitespace strings."""
+    if val is None:
+        return True
+    try:
+        if pd.isna(val):
+            return True
+    except (ValueError, TypeError):
+        pass
+    if isinstance(val, str) and val.strip() in ("", "nan", "None"):
+        return True
+    return False
+
+
+def _find_drug_column(df: pd.DataFrame) -> str:
+    """
+    Return the name of the column that identifies the drug/compound.
+    Tries a priority list of common names; falls back to the first column.
+    """
+    candidates = ["drug_name", "drug", "compound_name", "molecule_name", "generic_name"]
+    for name in candidates:
+        if name in df.columns:
+            return name
+    fallback = df.columns[0]
+    print(
+        f"WARNING: No recognised drug-name column found "
+        f"({candidates}). Using '{fallback}' as the drug identifier."
+    )
+    return fallback
+
+
+# ---------------------------------------------------------------------------
+# Region-priority logic — mirrors excel_processing_script.py exactly
+# so that tier assignments are consistent between the two files.
+# ---------------------------------------------------------------------------
+
+_EU_COUNTRY_NAMES = {
+    "austria", "belgium", "bulgaria", "croatia", "cyprus", "czech republic",
+    "czechia", "denmark", "estonia", "finland", "france", "germany", "greece",
+    "hungary", "ireland", "italy", "latvia", "lithuania", "luxembourg", "malta",
+    "netherlands", "poland", "portugal", "romania", "slovakia", "slovenia",
+    "spain", "sweden",
+}
+
+_TIER2_NAMES = {"canada", "switzerland", "australia", "japan"}
+
+
+def _region_tier(region_val) -> int:
+    """
+    Return the geographic tier (1 / 2 / 3) for a primary_region value.
+
+    Tier 1: United States / US / UK / Europe / EU / any EU member-state name
+    Tier 2: Canada, Switzerland, Australia, Japan
+    Tier 3: everything else (including missing)
+    """
+    if _is_missing(region_val):
+        return 3
+    text = str(region_val).strip().lower()
+    if re.search(r"\b(us|usa|united states|u\.s\.a?\.?)\b", text):
+        return 1
+    if re.search(r"\b(uk|u\.k\.|united kingdom|great britain|gb)\b", text):
+        return 1
+    if re.search(r"\b(europe|eu|european union|e\.u\.)\b", text):
+        return 1
+    if text in _EU_COUNTRY_NAMES:
+        return 1
+    if text in _TIER2_NAMES:
+        return 2
+    if re.search(r"\b(canada|switzerland|australia|japan)\b", text):
+        return 2
+    return 3
+
+
+# ---------------------------------------------------------------------------
+# Phase-rank helper (used by w_dose to rank phases within a dosage group)
+# ---------------------------------------------------------------------------
+
+def _phase_rank(phase_val) -> int:
+    """
+    Map a phase label to a comparable integer.
+    Higher = more advanced phase.
+
+    approved / marketed → 4
+    Phase IV / 4        → 4
+    Phase III / 3       → 3
+    Phase II / 2        → 2
+    Phase I / 1         → 1
+    Preclinical / None  → 0
+    """
+    if _is_missing(phase_val):
+        return 0
+    text = str(phase_val).strip().lower()
+    if re.search(r"\b(approved|approv|marketed|market)\b", text):
+        return 4
+    roman_map = {"iv": 4, "iii": 3, "ii": 2, "i": 1}
+    for roman, val in roman_map.items():
+        if re.search(rf"\b{roman}\b", text):
+            return val
+    m = re.search(r"\b([1-4])\b", text)
+    if m:
+        return int(m.group(1))
+    if re.search(r"\bpreclinical\b", text):
+        return 0
+    return 0
+
+
+# ===========================================================================
+# 1. prior
+# ===========================================================================
+
+def add_prior(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'prior' based on association_score.
+
+      association_score > 0.40          → prior = 0.8
+      0.10 <= association_score <= 0.40 → prior = 0.4
+      association_score < 0.10          → prior = 0.0
+      missing / no data                 → prior = 0.0
+    """
+    if "association_score" not in df.columns:
+        print("WARNING: 'association_score' column not found. 'prior' will be 0 for all rows.")
+        df["prior"] = 0.0
+        return df
+
+    def _prior(val):
+        if _is_missing(val):
+            return 0.0
+        try:
+            score = float(val)
+        except (ValueError, TypeError):
+            return 0.0
+        if score > 0.40:
+            return 0.8
+        if score >= 0.10:          # 0.10 <= score <= 0.40
+            return 0.4
+        return 0.0                 # score < 0.10
+
+    df["prior"] = df["association_score"].apply(_prior)
+    print(f"  [1] 'prior' added.  Value counts:\n{df['prior'].value_counts().to_string()}")
+    return df
+
+
+# ===========================================================================
+# 2. maturity_weight
+# ===========================================================================
+
+def add_maturity_weight(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'maturity_weight' based on phase.
+
+      None / unavailable / Preclinical → 0.05
+      Phase 1 / 1                      → 0.10
+      Phase 2 / 2                      → 0.30
+      Phase 3 / 3                      → 0.60
+      Phase 4 / 4 / Approved           → 1.00
+    """
+    if "phase" not in df.columns:
+        print("WARNING: 'phase' column not found. 'maturity_weight' will be 0.05 for all rows.")
+        df["maturity_weight"] = 0.05
+        return df
+
+    def _maturity(val):
+        if _is_missing(val):
+            return 0.05
+        text = str(val).strip().lower()
+        if re.search(r"\b(approved|approv|marketed|market)\b", text):
+            return 1.00
+        if re.search(r"\bpreclinical\b", text):
+            return 0.05
+        # Roman numerals checked longest-first so "iii" is caught before "i"
+        if re.search(r"\biv\b", text) or re.search(r"\b4\b", text):
+            return 1.00
+        if re.search(r"\biii\b", text) or re.search(r"\b3\b", text):
+            return 0.60
+        if re.search(r"\bii\b", text) or re.search(r"\b2\b", text):
+            return 0.30
+        if re.search(r"\bi\b", text) or re.search(r"\b1\b", text):
+            return 0.10
+        # Anything unrecognised treated as unavailable
+        return 0.05
+
+    df["maturity_weight"] = df["phase"].apply(_maturity)
+    print(f"  [2] 'maturity_weight' added.  Value counts:\n{df['maturity_weight'].value_counts().to_string()}")
+    return df
+
+
+# ===========================================================================
+# 3. effective_indications  &  effective_therapy_areas
+# ===========================================================================
+
+def add_effective_indications(df: pd.DataFrame, drug_col: str) -> pd.DataFrame:
+    """
+    Add columns 'effective_indications' and 'effective_therapy_areas'.
+
+    effective_indications:
+        Sum of maturity_weight across ALL rows that share the same drug
+        (drug_col). Drug-level aggregate broadcast back to every row of
+        that drug.
+
+    effective_therapy_areas:
+        Sum of the mean maturity_weight across all therapy areas.
+        For each unique therapy_area, the mean of maturity_weight is
+        computed across all rows in that TA. Those per-TA means are then
+        summed to a single dataset-level scalar, broadcast to every row.
+
+        Formula:
+            effective_therapy_areas = sum over each TA of mean(maturity_weight within TA)
+
+    Requires 'maturity_weight' and 'therapy_area' to already exist
+    (add_maturity_weight first).
+    """
+    if "maturity_weight" not in df.columns:
+        raise ValueError("'maturity_weight' column missing — run add_maturity_weight() first.")
+    if drug_col not in df.columns:
+        raise ValueError(f"Drug column '{drug_col}' not found in dataframe.")
+
+    # --- effective_indications: drug-level sum of maturity_weight ----------
+    drug_sum = (
+        df.groupby(drug_col, sort=False)["maturity_weight"]
+        .sum()
+        .rename("_drug_maturity_sum")
+    )
+    df = df.join(drug_sum, on=drug_col)
+    df["effective_indications"] = df["_drug_maturity_sum"]
+    df = df.drop(columns=["_drug_maturity_sum"])
+
+    # --- effective_therapy_areas: sum of per-TA mean of maturity_weight ----
+    if "therapy_area" not in df.columns:
+        print(
+            "WARNING: 'therapy_area' column not found. "
+            "'effective_therapy_areas' will be NaN."
+        )
+        df["effective_therapy_areas"] = float("nan")
+    else:
+        eff_ta = (
+            df.groupby("therapy_area", sort=False)["maturity_weight"]
+            .mean()
+            .sum()
+        )
+        df["effective_therapy_areas"] = eff_ta
+
+    print(
+        f"  [3] 'effective_indications' and 'effective_therapy_areas' added:\n"
+        f"       effective_indications   = {df['effective_indications'].iloc[0]:.4f} "
+        f"(drug-level sum of maturity_weight)\n"
+        f"       effective_therapy_areas = {df['effective_therapy_areas'].iloc[0]:.4f} "
+        f"(sum of per-TA mean of maturity_weight)"
+    )
+    return df
+
+
+# ===========================================================================
+# 4. w_geo
+# ===========================================================================
+
+def add_w_geo(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'w_geo' based on the geographic tier of primary_region.
+
+      Tier 1 (US / UK / EU / EU member states) → 1.00
+      Tier 2 (Canada / Switzerland / Australia / Japan) → 0.85
+      Tier 3 (everything else, including missing)       → 0.65
+    """
+    if "primary_region" not in df.columns:
+        print("WARNING: 'primary_region' column not found. 'w_geo' will be 0.65 for all rows.")
+        df["w_geo"] = 0.65
+        return df
+
+    _tier_to_weight = {1: 1.00, 2: 0.85, 3: 0.65}
+
+    df["w_geo"] = df["primary_region"].apply(
+        lambda r: _tier_to_weight[_region_tier(r)]
+    )
+    print(f"  [4] 'w_geo' added.  Value counts:\n{df['w_geo'].value_counts().to_string()}")
+    return df
+
+
+# ===========================================================================
+# 5. w_dose
+# ===========================================================================
+
+def add_w_dose(df: pd.DataFrame, drug_col: str) -> pd.DataFrame:
+    """
+    Add column 'w_dose'.
+
+    Logic:
+      - Group rows by (TA-I, dosage).
+      - Within each such group, rank the rows by their phase (descending).
+      - The row with the highest phase in the group gets w_dose = 1.00.
+      - The row with the next-highest phase gets w_dose = 0.75.
+      - If a TA-I has only one dosage, or all rows in the group share the
+        same phase, all rows in that group receive w_dose = 1.00.
+      - Rows with missing dosage are isolated into their own per-TA-I group
+        and all receive w_dose = 1.00 (no relative ranking is possible).
+
+    "Highest phase" for a row is determined by _phase_rank applied to its
+    phase value. Ties within a group receive the same rank and therefore the
+    same w_dose (dense ranking).
+    """
+    required = {"TA - I", "dosage", "phase"}
+    missing_cols = required - set(df.columns)
+    if missing_cols:
+        print(
+            f"WARNING: w_dose requires columns {required}. "
+            f"Missing: {missing_cols}.  'w_dose' will be 1.0 for all rows."
+        )
+        df["w_dose"] = 1.0
+        return df
+
+    # Normalise dosage: strip whitespace, lowercase, sentinel for missing
+    _MISSING_DOSE_SENTINEL = "__missing__"
+
+    def _norm_dose(val):
+        if _is_missing(val):
+            return _MISSING_DOSE_SENTINEL
+        return str(val).strip().lower()
+
+    df["_dose_key"] = df["dosage"].apply(_norm_dose)
+    df["_phase_rank_num"] = df["phase"].apply(_phase_rank)
+
+    # Within each (TA-I, dosage) group, dense-rank rows by phase DESC.
+    # Ties share the same rank → same w_dose.
+    # dropna=False is required: otherwise rows whose 'TA - I' (or '_dose_key')
+    # is NaN are silently excluded from every group, and rank() returns NaN
+    # for them, which then blows up on the subsequent .astype(int).
+    df["_dose_rank"] = (
+        df.groupby(["TA - I", "_dose_key"], sort=False, dropna=False)["_phase_rank_num"]
+        .rank(method="dense", ascending=False)
+        .astype(int)
+    )
+
+    def _dose_rank_to_weight(rank: int) -> float:
+        if rank == 1:
+            return 1.00
+        return 0.75   # rank 2 and beyond
+
+    df["w_dose"] = df["_dose_rank"].apply(_dose_rank_to_weight)
+
+    # Rows with missing dosage always get w_dose = 1.0 regardless of rank
+    df.loc[df["_dose_key"] == _MISSING_DOSE_SENTINEL, "w_dose"] = 1.0
+
+    df = df.drop(columns=["_dose_key", "_phase_rank_num", "_dose_rank"])
+
+    print(f"  [5] 'w_dose' added.  Value counts:\n{df['w_dose'].value_counts().to_string()}")
+    return df
+
+
+# ===========================================================================
+# 6. w_sample
+# ===========================================================================
+
+def add_w_sample(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'w_sample' based on drug_arm_size_n.
+
+      >= 500          → 1.00
+      >= 200, < 500   → 0.85
+      >= 50,  < 200   → 0.65
+      < 50            → 0.40
+      missing         → 0.40  (conservative default)
+    """
+    if "drug_arm_size_n" not in df.columns:
+        print(
+            "WARNING: 'drug_arm_size_n' column not found. "
+            "'w_sample' will be 0.40 for all rows."
+        )
+        df["w_sample"] = 0.40
+        return df
+
+    def _w_sample(val):
+        if _is_missing(val):
+            return 0.40
+        try:
+            n = float(val)
+        except (ValueError, TypeError):
+            return 0.40
+        if n >= 500:
+            return 1.00
+        if n >= 200:
+            return 0.85
+        if n >= 50:
+            return 0.65
+        return 0.40
+
+    df["w_sample"] = df["drug_arm_size_n"].apply(_w_sample)
+    print(f"  [6] 'w_sample' added.  Value counts:\n{df['w_sample'].value_counts().to_string()}")
+    return df
+
+
+# ===========================================================================
+# 6b. Non-clinical-trial overrides for w_geo, w_dose, w_sample
+# ===========================================================================
+
+def add_non_ct_overrides(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Override w_geo, w_dose, and w_sample to 1.00 for any row where
+    data_source is not 'Clinical Trials'.
+
+    Comparison is case-insensitive and whitespace-trimmed. Rows with a
+    missing/blank data_source are treated as NOT 'Clinical Trials' (i.e.
+    they also get overridden to 1.00), since we can't confirm they came
+    from a clinical trial.
+
+    Requires 'w_geo', 'w_dose', 'w_sample' to already exist (steps 4-6).
+    """
+    required = {"w_geo", "w_dose", "w_sample"}
+    missing_cols = required - set(df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"'add_non_ct_overrides' requires {required}. Missing: {missing_cols}. "
+            "Ensure steps 4, 5, and 6 have run."
+        )
+
+    if "data_source" not in df.columns:
+        print(
+            "WARNING: 'data_source' column not found. "
+            "No non-clinical-trial overrides applied."
+        )
+        return df
+
+    def _is_clinical_trials(val) -> bool:
+        if _is_missing(val):
+            return False
+        return str(val).strip().lower() == "clinical trials"
+
+    is_ct = df["data_source"].apply(_is_clinical_trials)
+    non_ct_mask = ~is_ct
+
+    df.loc[non_ct_mask, ["w_geo", "w_dose", "w_sample"]] = 1.00
+
+    print(
+        f"  [6b] Non-clinical-trial overrides applied.  "
+        f"Rows overridden (data_source != 'Clinical Trials'): {non_ct_mask.sum()} / {len(df)}"
+    )
+    return df
+
+
+# ===========================================================================
+# 7. Q_i
+# ===========================================================================
+
+def add_Q_i(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'Q_i'.
+
+      Q_i = w_geo × w_sample × w_dose
+
+    Requires w_geo, w_sample, and w_dose to already exist.
+    """
+    required = {"w_geo", "w_sample", "w_dose"}
+    missing_cols = required - set(df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"'Q_i' calculation requires {required}. Missing: {missing_cols}. "
+            "Ensure steps 4, 5, and 6 have run."
+        )
+
+    df["Q_i"] = df["w_geo"] * df["w_sample"] * df["w_dose"]
+    print(
+        f"  [7] 'Q_i' added (w_geo × w_sample × w_dose).  "
+        f"Range: {df['Q_i'].min():.4f} – {df['Q_i'].max():.4f}"
+    )
+    return df
+
+
+# ===========================================================================
+# 8. e_i
+# ===========================================================================
+
+def add_e_i(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'e_i'.
+
+      e_i = Q_i × e_phase_i
+
+    Requires Q_i and e_phase_i to already exist.
+    """
+    required = {"Q_i", "e_phase_i"}
+    missing_cols = required - set(df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"'e_i' calculation requires {required}. Missing: {missing_cols}. "
+            "Ensure steps 7 and 8b have run."
+        )
+
+    df["e_i"] = df["Q_i"] * df["e_phase_i"]
+    print(
+        f"  [8] 'e_i' added (Q_i × e_phase_i).  "
+        f"Range: {df['e_i'].min():.4f} – {df['e_i'].max():.4f}"
+    )
+    return df
+
+
+# ===========================================================================
+# 8b. e_phase_i
+# ===========================================================================
+
+# Lookup table: (phase_bucket, association_bucket) → e_phase_i value
+_E_PHASE_TABLE = {
+    ("phase1",   "obvious"):  0.10,
+    ("phase1",   "indirect"): 0.10,
+    ("phase1",   "novel"):    0.10,
+    ("phase2",   "obvious"):  0.40,
+    ("phase2",   "indirect"): 0.35,
+    ("phase2",   "novel"):    0.30,
+    ("phase3",   "obvious"):  0.80,
+    ("phase3",   "indirect"): 0.65,
+    ("phase3",   "novel"):    0.55,
+    ("approved", "obvious"):  1.00,
+    ("approved", "indirect"): 1.00,
+    ("approved", "novel"):    1.00,
+}
+
+
+def _phase_bucket(val) -> str | None:
+    """
+    Map a phase label to one of the four lookup-table buckets:
+    'phase1', 'phase2', 'phase3', 'approved'.
+    Returns None for missing or unrecognised values.
+    """
+    if _is_missing(val):
+        return None
+    text = str(val).strip().lower()
+    if re.search(r"\b(approved|approv|marketed|market)\b", text):
+        return "approved"
+    # Phase IV / 4 treated as Approved
+    if re.search(r"\biv\b", text) or re.search(r"\b4\b", text):
+        return "approved"
+    if re.search(r"\biii\b", text) or re.search(r"\b3\b", text):
+        return "phase3"
+    if re.search(r"\bii\b", text) or re.search(r"\b2\b", text):
+        return "phase2"
+    if re.search(r"\bi\b", text) or re.search(r"\b1\b", text):
+        return "phase1"
+    return None
+
+
+def _assoc_bucket(val) -> str:
+    """
+    Map an association_score to one of three buckets:
+      > 0.40            → 'obvious'
+      0.10 <= x <= 0.40 → 'indirect'
+      < 0.10 or missing → 'novel'
+    """
+    if _is_missing(val):
+        return "novel"
+    try:
+        score = float(val)
+    except (ValueError, TypeError):
+        return "novel"
+    if score > 0.40:
+        return "obvious"
+    if score >= 0.10:
+        return "indirect"
+    return "novel"
+
+
+def add_e_phase_i(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'e_phase_i'.
+
+    Looks up a fixed evidence weight from the combination of:
+      - phase bucket  : phase1 | phase2 | phase3 | approved
+      - association bucket: obvious (score > 0.40)
+                            indirect (0.10 <= score <= 0.40)
+                            novel    (score < 0.10 or missing)
+
+    Lookup table:
+      +-----------+---------+----------+-------+
+      | Phase     | Obvious | Indirect | Novel |
+      +-----------+---------+----------+-------+
+      | Phase 1   |  0.10   |  0.10    |  0.10 |
+      | Phase 2   |  0.40   |  0.35    |  0.30 |
+      | Phase 3   |  0.80   |  0.65    |  0.55 |
+      | Approved  |  1.00   |  1.00    |  1.00 |
+      +-----------+---------+----------+-------+
+
+    Rows where phase is missing or unrecognised receive NaN.
+    Rows where association_score is missing are treated as 'novel'.
+
+    Requires 'phase' to already exist.
+    'association_score' is optional (missing → treated as novel).
+    """
+    if "phase" not in df.columns:
+        print(
+            "WARNING: 'phase' column not found. "
+            "'e_phase_i' will be NaN for all rows."
+        )
+        df["e_phase_i"] = float("nan")
+        return df
+
+    if "association_score" not in df.columns:
+        print(
+            "WARNING: 'association_score' column not found. "
+            "All rows will be treated as 'novel' for 'e_phase_i'."
+        )
+
+    def _lookup(row):
+        pb = _phase_bucket(row["phase"])
+        ab = _assoc_bucket(row.get("association_score"))
+        if pb is None:
+            return float("nan")
+        return _E_PHASE_TABLE[(pb, ab)]
+
+    df["e_phase_i"] = df.apply(_lookup, axis=1)
+
+    print(
+        f"  [8b] 'e_phase_i' added (phase × association bucket lookup).  "
+        f"Value counts:\n{df['e_phase_i'].value_counts().sort_index().to_string()}"
+    )
+    return df
+
+
+# ===========================================================================
+# 9. Link
+# ===========================================================================
+
+def add_link(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'Link'.
+
+      Link = 1 - (1 - prior) × (1 - e_i)
+
+    This is a probabilistic union: it combines prior belief (prior) with
+    trial evidence (e_i) such that either alone can drive Link toward 1,
+    and neither can push it below 0.
+
+    Requires prior and e_i to already exist.
+    """
+    required = {"prior", "e_i"}
+    missing_cols = required - set(df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"'Link' calculation requires {required}. Missing: {missing_cols}. "
+            "Ensure steps 1 and 8 have run."
+        )
+
+    df["Link"] = 1 - (1 - df["prior"]) * (1 - df["e_i"])
+    print(
+        f"  [9] 'Link' added (1 - (1 - prior) × (1 - e_i)).  "
+        f"Range: {df['Link'].min():.4f} – {df['Link'].max():.4f}"
+    )
+    return df
+
+
+# ===========================================================================
+# 10. Link_TA
+# ===========================================================================
+
+def add_link_ta(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'Link_TA'.
+
+      Link_TA = mean of Link across all rows that share the same therapy_area.
+
+    This is a therapy-area-level aggregate broadcast back to every row
+    belonging to that therapy area.
+
+    Requires 'Link' to already exist (add_link first) and 'therapy_area'
+    to be present in the dataframe.
+
+    Rows whose therapy_area is missing are grouped together under a single
+    NaN key; their Link_TA will be the mean of Link for all such rows.
+    """
+    if "Link" not in df.columns:
+        raise ValueError(
+            "'Link_TA' calculation requires 'Link'. "
+            "Ensure step 9 (add_link) has run."
+        )
+    if "therapy_area" not in df.columns:
+        print(
+            "WARNING: 'therapy_area' column not found. "
+            "'Link_TA' will be NaN for all rows."
+        )
+        df["Link_TA"] = float("nan")
+        return df
+
+    ta_mean = (
+        df.groupby("therapy_area", sort=False, dropna=False)["Link"]
+        .mean()
+        .rename("Link_TA")
+    )
+    df = df.join(ta_mean, on="therapy_area")
+
+    print(
+        f"  [10] 'Link_TA' added (mean of Link per therapy_area).  "
+        f"Range: {df['Link_TA'].min():.4f} – {df['Link_TA'].max():.4f}"
+    )
+    return df
+
+
+# ===========================================================================
+# 11. L_ind, B_raw_ind, B_ind
+# ===========================================================================
+
+# Logistic-curve constants (fixed for the entire model)
+_N0 = 9       # inflection point
+_A  = 0.40    # steepness parameter
+
+
+def _l_ind(x: float) -> float:
+    """
+    Logistic transformation of x.
+
+      L_ind(x) = 1 / (1 + exp(-a * (x - N0)))
+               = 1 / (1 + exp(-0.40 * (x - 9)))
+    """
+    return 1.0 / (1.0 + math.exp(-_A * (x - _N0)))
+
+
+def _b_raw_ind(x: float, l_ind_0: float) -> float:
+    """
+    Raw normalised indication breadth at x.
+
+      B_raw_ind(x) = (L_ind(x) - L_ind(0)) / (1 - L_ind(0))
+    """
+    return (_l_ind(x) - l_ind_0) / (1.0 - l_ind_0)
+
+
+def add_indication_breadth(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add three dataset-level constant columns:
+
+      L_ind     = L_ind(x)
+                  where x = number of unique values in ot_disease_name
+
+      B_raw_ind = B_raw_ind(x)
+                = (L_ind(x) - L_ind(0)) / (1 - L_ind(0))
+
+      B_ind     = min(1, B_raw_ind(N_eff_ind) / B_raw_ind(15))
+                  where N_eff_ind is read from effective_indications (single
+                  repeated value across all rows)
+
+    All three are scalars derived once from the dataset and then broadcast
+    identically to every row.
+
+    Requires 'effective_indications' and 'ot_disease_name' to already exist.
+    """
+    if "effective_indications" not in df.columns:
+        raise ValueError(
+            "'L_ind'/'B_raw_ind'/'B_ind' require 'effective_indications'. "
+            "Ensure step 3 (add_effective_indications) has run."
+        )
+    if "ot_disease_name" not in df.columns:
+        print(
+            "WARNING: 'ot_disease_name' column not found. "
+            "'L_ind', 'B_raw_ind', 'B_ind' will be set to NaN."
+        )
+        df["L_ind"] = df["B_raw_ind"] = df["B_ind"] = float("nan")
+        return df
+
+    # x = unique disease count; N_eff_ind = single repeated value
+    x         = df["effective_indications"].iloc[0]
+    n_eff_ind = df["effective_indications"].iloc[0]
+
+    # Anchor and derived values
+    l_ind_0      = _l_ind(0)                        # L_ind(0)
+    l_ind_x      = _l_ind(x)                        # L_ind(x) → stored as L_ind column
+    b_raw_ind_x  = _b_raw_ind(x, l_ind_0)           # B_raw_ind(x) → stored as B_raw_ind column
+    b_raw_ind_n  = _b_raw_ind(n_eff_ind, l_ind_0)   # B_raw_ind(N_eff_ind) — numerator of B_ind
+    b_raw_ind_15 = _b_raw_ind(15, l_ind_0)          # B_raw_ind(15) — normaliser
+
+    # Guard: if B_raw_ind(15) is effectively zero, B_ind cannot be normalised
+    if abs(b_raw_ind_15) < 1e-12:
+        print(
+            "WARNING: B_raw_ind(15) is effectively zero; "
+            "'B_ind' will be set to NaN."
+        )
+        b_ind = float("nan")
+    else:
+        b_ind = min(1.0, b_raw_ind_n / b_raw_ind_15)
+
+    # Broadcast constant scalars to every row
+    df["L_ind"]     = l_ind_x
+    df["B_raw_ind"] = b_raw_ind_x
+    df["B_ind"]     = b_ind
+
+    print(
+        f"  [11] Indication-breadth columns added (dataset-level constants):\n"
+        f"       x (unique ot_disease_name) = {x}\n"
+        f"       N_eff_ind                  = {n_eff_ind:.4f}\n"
+        f"       L_ind(0)                   = {l_ind_0:.6f}\n"
+        f"       L_ind  = L_ind(x)          = {l_ind_x:.6f}\n"
+        f"       B_raw_ind = B_raw_ind(x)   = {b_raw_ind_x:.6f}\n"
+        f"       B_raw_ind(N_eff_ind)        = {b_raw_ind_n:.6f}\n"
+        f"       B_raw_ind(15)               = {b_raw_ind_15:.6f}\n"
+        f"       B_ind                       = {b_ind:.6f}"
+    )
+    return df
+
+
+# ===========================================================================
+# 12. L_TA, B_raw_TA, B_TA
+# ===========================================================================
+
+# Logistic-curve constant for therapy-area breadth (inflection point and steepness differ)
+_N0_TA = 3    # inflection point for TA curve (vs 9 for indication curve)
+_A_TA  = 0.9  # steepness for TA curve (vs 0.40 for indication curve)
+
+
+def _l_ta(x: float) -> float:
+    """
+    Logistic transformation of x for the therapy-area curve.
+
+      L_TA(x) = 1 / (1 + exp(-0.9 * (x - 3)))
+    """
+    return 1.0 / (1.0 + math.exp(-_A_TA * (x - _N0_TA)))
+
+
+def _b_raw_ta(x: float, l_ta_0: float) -> float:
+    """
+    Raw normalised therapy-area breadth at x.
+
+      B_raw_TA(x) = (L_TA(x) - L_TA(0)) / (1 - L_TA(0))
+    """
+    return (_l_ta(x) - l_ta_0) / (1.0 - l_ta_0)
+
+
+def add_therapy_area_breadth(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add three dataset-level constant columns:
+
+      L_TA     = L_TA(x)
+                 where x = number of unique values in therapy_area
+
+      B_raw_TA = B_raw_TA(x)
+               = (L_TA(x) - L_TA(0)) / (1 - L_TA(0))
+
+      B_TA     = min(1, B_raw_TA(N_eff_ta) / B_raw_TA(5))
+                 where N_eff_ta is read from effective_therapy_areas (single
+                 repeated value — sum of per-TA mean of maturity_weight)
+
+    All three are scalars derived once from the dataset and then broadcast
+    identically to every row.
+
+    Requires 'effective_therapy_areas' and 'therapy_area' to already exist.
+    """
+    if "effective_therapy_areas" not in df.columns:
+        raise ValueError(
+            "'L_TA'/'B_raw_TA'/'B_TA' require 'effective_therapy_areas'. "
+            "Ensure step 3 (add_effective_indications) has run."
+        )
+    if "therapy_area" not in df.columns:
+        print(
+            "WARNING: 'therapy_area' column not found. "
+            "'L_TA', 'B_raw_TA', 'B_TA' will be set to NaN."
+        )
+        df["L_TA"] = df["B_raw_TA"] = df["B_TA"] = float("nan")
+        return df
+
+    # x = unique therapy area count; N_eff_ta = single repeated value
+    x        = df["effective_therapy_areas"].iloc[0]
+    n_eff_ta = df["effective_therapy_areas"].iloc[0]
+
+    # Anchor and derived values
+    l_ta_0      = _l_ta(0)               # L_TA(0)
+    l_ta_x      = _l_ta(x)              # L_TA(x) → stored as L_TA column
+    b_raw_ta_x  = _b_raw_ta(x, l_ta_0)  # B_raw_TA(x) → stored as B_raw_TA column
+    b_raw_ta_n  = _b_raw_ta(n_eff_ta, l_ta_0)  # B_raw_TA(N_eff_ta) — numerator of B_TA
+    b_raw_ta_5  = _b_raw_ta(5, l_ta_0)          # B_raw_TA(5) — normaliser
+
+    # Guard: if B_raw_TA(5) is effectively zero, B_TA cannot be normalised
+    if abs(b_raw_ta_5) < 1e-12:
+        print(
+            "WARNING: B_raw_TA(5) is effectively zero; "
+            "'B_TA' will be set to NaN."
+        )
+        b_ta = float("nan")
+    else:
+        b_ta = min(1.0, b_raw_ta_n / b_raw_ta_5)
+
+    # Broadcast constant scalars to every row
+    df["L_TA"]     = l_ta_x
+    df["B_raw_TA"] = b_raw_ta_x
+    df["B_TA"]     = b_ta
+
+    print(
+        f"  [12] Therapy-area breadth columns added (dataset-level constants):\n"
+        f"       x (unique therapy_area)    = {x}\n"
+        f"       N_eff_ta                   = {n_eff_ta:.4f}\n"
+        f"       L_TA(0)                    = {l_ta_0:.6f}\n"
+        f"       L_TA   = L_TA(x)           = {l_ta_x:.6f}\n"
+        f"       B_raw_TA = B_raw_TA(x)     = {b_raw_ta_x:.6f}\n"
+        f"       B_raw_TA(N_eff_ta)          = {b_raw_ta_n:.6f}\n"
+        f"       B_raw_TA(5)                 = {b_raw_ta_5:.6f}\n"
+        f"       B_TA                        = {b_ta:.6f}"
+    )
+    return df
+
+
+# ===========================================================================
+# 13. B
+# ===========================================================================
+
+def add_B(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'B'.
+
+      B = B_ind * B_TA
+
+    Requires 'B_ind' and 'B_TA' to already exist (steps 11 and 12).
+    """
+    required = {"B_ind", "B_TA"}
+    missing_cols = required - set(df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"'B' calculation requires {required}. Missing: {missing_cols}. "
+            "Ensure steps 11 and 12 have run."
+        )
+
+    df["B"] = df["B_ind"] * df["B_TA"]
+    print(
+        f"  [13] 'B' added (B_ind × B_TA).  "
+        f"Value: {df['B'].iloc[0]:.6f}"
+    )
+    return df
+
+
+# ===========================================================================
+# 14. Overall Coherence
+# ===========================================================================
+
+def add_overall_coherence(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'Overall Coherence'.
+
+      Overall Coherence = ( Σ(Wᵢ × √Lᵢ) / Σ(Wᵢ) )²
+
+    Where the sum is across all unique therapy areas:
+      Wᵢ = count of unique ot_disease_name values within therapy area i
+      Lᵢ = Link_TA of therapy area i (average of Link for that therapy area)
+
+    The result is a single scalar broadcast identically to every row.
+
+    Requires 'Link_TA', 'therapy_area', and 'ot_disease_name' to exist.
+    """
+    required = {"Link_TA", "therapy_area", "ot_disease_name"}
+    missing_cols = required - set(df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"'Overall Coherence' requires {required}. Missing: {missing_cols}. "
+            "Ensure steps 10, and the therapy_area/ot_disease_name columns exist."
+        )
+
+    # Build a per-therapy-area summary table
+    # Wᵢ: unique ot_disease_name count per therapy_area
+    # Lᵢ: Link_TA for that therapy_area (constant within group, take first value)
+    ta_summary = (
+        df.groupby("therapy_area", sort=False)
+        .agg(
+            W=("ot_disease_name", "nunique"),
+            L=("Link_TA", "first")
+        )
+        .reset_index()
+    )
+
+    # Wᵢ × √Lᵢ — guard against negative L values before sqrt
+    ta_summary["W_sqrt_L"] = ta_summary["W"] * ta_summary["L"].clip(lower=0).pow(0.5)
+
+    sum_w_sqrt_l = ta_summary["W_sqrt_L"].sum()
+    sum_w        = ta_summary["W"].sum()
+
+    if sum_w == 0:
+        print("WARNING: Σ(Wᵢ) is zero; 'Overall Coherence' will be NaN.")
+        overall_coherence = float("nan")
+    else:
+        overall_coherence = (sum_w_sqrt_l / sum_w) ** 2
+
+    df["Overall Coherence"] = overall_coherence
+
+    print(
+        f"  [14] 'Overall Coherence' added (dataset-level constant):\n"
+        f"       Therapy areas considered : {len(ta_summary)}\n"
+        f"       Σ(Wᵢ)                   = {sum_w}\n"
+        f"       Σ(Wᵢ × √Lᵢ)            = {sum_w_sqrt_l:.6f}\n"
+        f"       Overall Coherence        = {overall_coherence:.6f}"
+    )
+    return df
+
+
+# ===========================================================================
+# 15. C
+# ===========================================================================
+
+def add_C(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'C'.
+
+      C = 0.1 + 0.9 × (Overall Coherence)^1.75
+
+    A dataset-level constant broadcast identically to every row.
+
+    Requires 'Overall Coherence' to already exist (step 14).
+    """
+    if "Overall Coherence" not in df.columns:
+        raise ValueError(
+            "'C' requires 'Overall Coherence'. "
+            "Ensure step 14 (add_overall_coherence) has run."
+        )
+
+    overall_coherence = df["Overall Coherence"].iloc[0]
+    c = 0.1 + 0.9 * (overall_coherence ** 1.75)
+
+    df["C"] = c
+
+    print(
+        f"  [15] 'C' added (dataset-level constant):\n"
+        f"       Overall Coherence = {overall_coherence:.6f}\n"
+        f"       C = 0.1 + 0.9 × ({overall_coherence:.6f})^1.75 = {c:.6f}"
+    )
+    return df
+
+
+# ===========================================================================
+# 16. Final Score
+# ===========================================================================
+
+def add_final_score(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add column 'Final Score'.
+
+      Final Score = 1 + 4 × B × C
+
+    A dataset-level constant broadcast identically to every row.
+
+    Requires 'B' and 'C' to already exist (steps 13 and 15).
+    """
+    required = {"B", "C"}
+    missing_cols = required - set(df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"'Final Score' requires {required}. Missing: {missing_cols}. "
+            "Ensure steps 13 and 15 have run."
+        )
+
+    b = df["B"].iloc[0]
+    c = df["C"].iloc[0]
+    final_score = 1 + 4 * b * c
+
+    df["Final Score"] = final_score
+
+    print(
+        f"  [16] 'Final Score' added (dataset-level constant):\n"
+        f"       B            = {b:.6f}\n"
+        f"       C            = {c:.6f}\n"
+        f"       Final Score  = 1 + 4 × {b:.6f} × {c:.6f} = {final_score:.6f}"
+    )
+    return df
+
+
+# ===========================================================================
+# Main pipeline
+# ===========================================================================
+
+def run_calculations(input_path: Path) -> Path:
+    """
+    Load the processed Excel file, apply all calculations in order,
+    and write the result to <stem>_calculated.xlsx.
+
+    Returns the output path.
+    """
+    if not input_path.exists():
+        print(f"ERROR: File not found: {input_path}")
+        sys.exit(1)
+
+    print(f"\nLoading: {input_path}")
+    df = pd.read_excel(input_path)
+    print(f"  Loaded {len(df)} rows × {len(df.columns)} columns.")
+
+    # Identify the drug column once; pass it to functions that need it
+    drug_col = _find_drug_column(df)
+    print(f"  Drug identifier column: '{drug_col}'")
+
+    print("\nRunning calculations ...")
+
+    df = add_prior(df)                           # 1
+    df = add_maturity_weight(df)                 # 2
+    df = add_effective_indications(df, drug_col) # 3
+    df = add_w_geo(df)                           # 4
+    df = add_w_dose(df, drug_col)                # 5
+    df = add_w_sample(df)                        # 6
+    df = add_non_ct_overrides(df)                # 6b
+    df = add_Q_i(df)                             # 7
+    df = add_e_phase_i(df)                       # 8b
+    df = add_e_i(df)                             # 8  (depends on e_phase_i)
+    df = add_link(df)                            # 9
+    df = add_link_ta(df)                         # 10
+    df = add_indication_breadth(df)              # 11
+    df = add_therapy_area_breadth(df)            # 12
+    df = add_B(df)                               # 13
+    df = add_overall_coherence(df)               # 14
+    df = add_C(df)                               # 15
+    df = add_final_score(df)                     # 16
+
+    # Write output
+    output_path = input_path.with_name(input_path.stem + "_calculated.xlsx")
+    df.to_excel(output_path, index=False)
+    print(f"\nOutput saved: {output_path}")
+    print(f"  Rows: {len(df)}  |  Columns: {len(df.columns)}")
+
+    return output_path
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    load_dotenv()
+
+    file_path = os.getenv("FILE")
+    if not file_path:
+        print("ERROR: 'FILE' variable not set in .env (or .env not found).")
+        sys.exit(1)
+
+    run_calculations(Path(file_path))
