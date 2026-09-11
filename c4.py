@@ -537,22 +537,37 @@ def _gemini_lookup_batch(trial_ids, api_key):
 
     try:
         parts = raw["candidates"][0]["content"]["parts"]
-        text = next(
-            (p["text"] for p in parts if "text" in p and not p.get("thought", False)),
-            None,
-        )
-        if text is None:
+        # Concatenate all non-thought text parts — Gemini with grounding can
+        # split its response across multiple parts.
+        text_parts = [
+            p["text"] for p in parts
+            if "text" in p and not p.get("thought", False)
+        ]
+        if not text_parts:
             raise ValueError("No text part in Gemini response")
+        text = " ".join(text_parts)
     except (KeyError, IndexError, ValueError) as e:
-        print(f"  WARNING: Unexpected Gemini response: {e}")
+        print(f"  WARNING: Unexpected Gemini response structure: {e}")
+        print(f"  Raw response keys: {list(raw.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].keys()) if raw.get('candidates') else 'no candidates'}")
         return []
 
+    # Strip markdown fences Gemini sometimes adds despite instructions
     text = re.sub(r"```json\s*|```\s*", "", text).strip()
+
+    # Extract the JSON array — find the outermost [ ... ] in case Gemini
+    # added preamble or postamble text around it
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if not match:
+        print(f"  WARNING: No JSON array found in Gemini response. Raw: {text[:500]}")
+        return []
+    text = match.group(0)
+
     try:
         results = json.loads(text)
         return results if isinstance(results, list) else []
     except json.JSONDecodeError as e:
-        print(f"  WARNING: Could not parse Gemini JSON: {e}\n  Raw: {text[:500]}")
+        print(f"  WARNING: Could not parse Gemini JSON: {e}")
+        print(f"  Raw: {text[:500]}")
         return []
 
 
