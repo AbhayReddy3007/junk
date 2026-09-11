@@ -1227,12 +1227,23 @@ def process():
                   .groupby("TA - I")["_phase_rank"]
                   .transform("max")
             )
+            # Never phase-dedup a TA-I that has exactly 1 row and is non-CT.
+            # (These should have been split out already, but guard here too.)
+            tai_row_counts = df.groupby("TA - I")["TA - I"].transform("count")
+            if "data_source" in df.columns:
+                ds_lower = df["data_source"].astype(str).str.strip().str.lower()
+                single_non_ct = (tai_row_counts == 1) & (ds_lower != "clinical trials")
+            else:
+                single_non_ct = pd.Series(False, index=df.index)
+
             before = len(df)
             pre_step3 = df.copy()
             # Keep a row if:
+            #   - it is the only row for its TA-I and is non-CT, OR
             #   - its phase is unknown (rank == -1), OR
             #   - its phase equals the highest known phase in the TA-I
             keep_mask = (
+                single_non_ct |
                 (df["_phase_rank"] == -1) |
                 (df["_phase_rank"] == df["_max_known_rank"])
             )
