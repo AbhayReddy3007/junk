@@ -135,12 +135,49 @@ class RemovalTracker:
 # Phase ranking
 # ---------------------------------------------------------------------------
 
+def normalize_phase(phase_value):
+    """Rename phase values to their canonical display string.
+    Returns the original value unchanged if no rule matches.
+    """
+    if pd.isna(phase_value):
+        return phase_value
+    text = str(phase_value).strip()
+    lower = text.lower()
+    # "Approved (EU)", "Submitted (U.S.)", any submitted/approved variant -> "Approved"
+    if ("approved" in lower or "approv" in lower or "market" in lower
+            or "submitted" in lower):
+        return "Approved"
+    # "Phase 3b", "3b", "IIIb" -> "Phase 3"
+    if re.search(r"3b", lower) or re.search(r"iiib", lower):
+        return "Phase 3"
+    return text
+
+
 def phase_rank(phase_value) -> int:
     if pd.isna(phase_value):
         return -1
     text = str(phase_value).strip().lower()
-    if "approved" in text or "approv" in text or "market" in text:
+    if ("approved" in text or "approv" in text or "market" in text
+            or "submitted" in text):
         return 4
+    if re.search(r"3b", text) or re.search(r"iiib", text):
+        return 3
+    roman = {"iii": 3, "ii": 2, "i": 1, "iv": 4}
+    for numeral, val in roman.items():
+        if re.search(rf"\b{numeral}\b", text):
+            return val
+    m = re.search(r"\b([1-4])\b", text)
+    if m:
+        return int(m.group(1))
+    return -1
+    text = str(phase_value).strip().lower()
+    # "Submitted" in any region (e.g. "Submitted (U.S.)") counts as approved
+    if ("approved" in text or "approv" in text or "market" in text
+            or "submitted" in text):
+        return 4
+    # "Phase 3b" / "3b" — treat as Phase 3
+    if re.search(r"3b", text) or re.search(r"iiib", text):
+        return 3
     roman = {"iii": 3, "ii": 2, "i": 1, "iv": 4}
     for numeral, val in roman.items():
         if re.search(rf"\b{numeral}\b", text):
@@ -1114,6 +1151,11 @@ def process():
             .str.strip()
         )
         print("Step 1 done: trial_id cleaned.")
+
+    # Normalise phase values to canonical strings before any phase-based logic
+    if "phase" in df.columns:
+        df["phase"] = df["phase"].apply(normalize_phase)
+        print("Phase values normalised.")
 
     # -----------------------------------------------------------------------
     # Step 2: Add TA - I
