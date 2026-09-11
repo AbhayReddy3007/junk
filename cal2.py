@@ -16,6 +16,8 @@ adds the following derived columns, one function per calculation:
     7.  Q_i                      – w_geo × w_sample × w_dose
     8.  e_i                      – Q_i × e_phase_i
     8b. e_phase_i                – phase × association bucket lookup
+    8c. (override)                e_phase_i forced to 0.05 for non-Clinical-Trials rows
+    8d. (override)                e_i forced to 1.00 when phase is Approved / 4
     9.  Link                     – 1 - (1 - prior) × (1 - e_i)
     10. Link_TA                  – average of Link across all rows sharing the
                                    same therapy_area
@@ -662,6 +664,42 @@ def add_e_i(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ===========================================================================
+# 8d. Approved-phase override for e_i
+# ===========================================================================
+
+def add_approved_e_i_override(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Override e_i to 1.00 for any row where phase is 'Approved' or '4'
+    (i.e. phase bucket == 'approved', per _phase_bucket — this also
+    covers 'Phase IV').
+
+    Requires 'phase' and 'e_i' to already exist. Must run AFTER add_e_i
+    (step 8) and BEFORE add_link (step 9), so Link is computed using the
+    overridden e_i value.
+    """
+    if "e_i" not in df.columns:
+        raise ValueError(
+            "'add_approved_e_i_override' requires 'e_i'. "
+            "Ensure step 8 (add_e_i) has run."
+        )
+    if "phase" not in df.columns:
+        print(
+            "WARNING: 'phase' column not found. "
+            "No approved-phase e_i override applied."
+        )
+        return df
+
+    approved_mask = df["phase"].apply(_phase_bucket) == "approved"
+    df.loc[approved_mask, "e_i"] = 1.00
+
+    print(
+        f"  [8d] Approved-phase override applied (e_i = 1.00).  "
+        f"Rows overridden (phase == Approved/4): {approved_mask.sum()} / {len(df)}"
+    )
+    return df
+
+
+# ===========================================================================
 # 8b. e_phase_i
 # ===========================================================================
 
@@ -1254,6 +1292,7 @@ def run_calculations(input_path: Path) -> Path:
     df = add_e_phase_i(df)                       # 8b
     df = add_non_ct_e_phase_override(df)         # 8c
     df = add_e_i(df)                             # 8  (depends on e_phase_i)
+    df = add_approved_e_i_override(df)           # 8d
     df = add_link(df)                            # 9
     df = add_link_ta(df)                         # 10
     df = add_indication_breadth(df)              # 11
