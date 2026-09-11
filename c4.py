@@ -1178,14 +1178,25 @@ def process():
             print("WARNING: 'phase' not found. Skipping step 3.")
         else:
             df["_phase_rank"] = df["phase"].apply(phase_rank)
-            df["_max_rank"]   = df.groupby("TA - I")["_phase_rank"].transform("max")
+            # Only consider known phases (rank > -1) when computing the max.
+            # Unknown/null phases get rank -1 and must not pull the max down.
+            df["_max_known_rank"] = (
+                df.where(df["_phase_rank"] > -1)
+                  .groupby("TA - I")["_phase_rank"]
+                  .transform("max")
+            )
             before = len(df)
             pre_step3 = df.copy()
-            df = df[df["_phase_rank"] == df["_max_rank"]].sort_index()
-            df = df.drop(columns=["_phase_rank", "_max_rank"])
-            print(f"Step 3 done: {before - len(df)} lower-phase row(s) removed.")
-            # Step 3 cannot fully remove a TA-I (all ranks equal → all kept), but
-            # snapshot anyway for safety
+            # Keep a row if:
+            #   - its phase is unknown (rank == -1), OR
+            #   - its phase equals the highest known phase in the TA-I
+            keep_mask = (
+                (df["_phase_rank"] == -1) |
+                (df["_phase_rank"] == df["_max_known_rank"])
+            )
+            df = df[keep_mask].sort_index()
+            df = df.drop(columns=["_phase_rank", "_max_known_rank"])
+            print(f"Step 3 done: {before - len(df)} explicitly lower-phase row(s) removed.")
             tracker.snapshot(df, 3, "Phase deduplication", pre_step_df=pre_step3)
 
         # -----------------------------------------------------------------------
