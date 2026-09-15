@@ -1,8 +1,10 @@
 """
 calculations.py
 ---------------
-Takes the output of trial_weight_calculator.py (a *_trial_weights.xlsx file)
-and adds the following derived columns, one function per calculation:
+Takes the "TA-I Summary" sheet from the *_trial_weights.xlsx file produced
+by trial_weight_calculator.py (one row per TA-I, the highest-weighted trial
+for each therapy_area / ot_disease_name combination) and adds the following
+derived columns, one function per calculation:
 
     1.  prior                    – based on association_score
     2.  maturity_weight          – based on phase
@@ -42,12 +44,22 @@ and adds the following derived columns, one function per calculation:
     15. C                        – 0.1 + 0.9 × (Overall Coherence)^1.75
     16. Final Score              – 1 + 4 × B × C
 
-Input compatibility with trial_weight_calculator.py
+Input: "TA-I Summary" sheet of *_trial_weights.xlsx
 ------------------------------------------------------
-trial_weight_calculator.py outputs a *_trial_weights.xlsx file whose columns
-include everything from the original input plus:
+trial_weight_calculator.py writes a *_trial_weights.xlsx file with three
+sheets.  This script reads only the "TA-I Summary" sheet, which contains
+one row per unique TA-I (the single highest-weighted trial for each
+therapy_area / ot_disease_name pair).  Its columns are a subset of the
+"Trial Weights" sheet columns:
 
     TA - I          therapy_area + " - " + ot_disease_name
+    therapy_area    therapeutic area label
+    ot_disease_name disease / indication name
+    phase           normalised phase label (e.g. "Phase 3", "Approved")
+    primary_region  geographic region string
+    drug_arm_size_n patients in the drug arm (numeric)
+    dosage          dose / regimen string
+    data_source     e.g. "Clinical Trials"
     phase_weight    computed by trial_weight_calculator
     geo_score       computed by trial_weight_calculator  (→ used as w_geo fallback)
     sample_score    computed by trial_weight_calculator  (→ used as w_sample fallback)
@@ -113,17 +125,19 @@ Usage:
     python calculations.py
 
     The input file path is read from the OUTPUT_FILE variable in the .env
-    file located in the working directory.  The script appends
-    '_trial_weights' to the stem automatically, so you can point OUTPUT_FILE
-    at either the original input or the *_trial_weights.xlsx output.
+    file located in the working directory.  Point OUTPUT_FILE at the
+    *_trial_weights.xlsx file produced by trial_weight_calculator.py; the
+    script will automatically read the "TA-I Summary" sheet within it.
+    If you point it at the original input file, the script will look for the
+    corresponding *_trial_weights.xlsx sibling automatically.
 
 Output:
     <stem>_calculated.xlsx  written alongside the input file.
 
 .env variables:
-    OUTPUT_FILE  – Path to the Excel file produced by trial_weight_calculator.py
-                   (i.e. the *_trial_weights.xlsx file), OR the original input
-                   file path (the script will resolve to the _trial_weights file).
+    OUTPUT_FILE  – Path to the *_trial_weights.xlsx file produced by
+                   trial_weight_calculator.py, OR the original input file
+                   path (the script will resolve to the _trial_weights file).
     FILE         – Alternative .env key accepted for backwards-compatibility.
                    OUTPUT_FILE takes precedence if both are set.
 
@@ -178,41 +192,67 @@ def _find_drug_column(df: pd.DataFrame) -> str:
     return fallback
 
 
+_TAI_SHEET = "TA-I Summary"
+
+
 def _resolve_input_path(raw_path: str) -> Path:
     """
-    Accept either:
-      - a *_trial_weights.xlsx path (direct output of trial_weight_calculator.py)
+    Resolve the path to the *_trial_weights.xlsx file whose "TA-I Summary"
+    sheet will be read.
+
+    Accepts either:
+      - a *_trial_weights.xlsx path directly
       - the original input path — the script will look for the corresponding
-        *_trial_weights.xlsx sibling file automatically.
+        *_trial_weights.xlsx sibling file automatically
 
     Raises FileNotFoundError if neither resolves to an existing file.
+    Raises ValueError if the resolved file does not contain a "TA-I Summary" sheet.
     """
     p = Path(raw_path)
 
     # If the path already points at the _trial_weights file, use it directly.
     if p.exists():
         if p.stem.endswith("_trial_weights"):
+            _check_tai_sheet(p)
             return p
         # The user gave the original file; derive the expected output path.
         candidate = p.with_name(p.stem + "_trial_weights.xlsx")
         if candidate.exists():
-            print(
-                f"  Note: INPUT_FILE resolved to trial_weights output: {candidate}"
-            )
+            print(f"  Note: INPUT_FILE resolved to trial_weights output: {candidate}")
+            _check_tai_sheet(candidate)
             return candidate
-        # Fall back to the path as given (may be a _processed.xlsx from old workflow).
+        # Fall back to the path as given.
+        _check_tai_sheet(p)
         return p
 
-    # Path doesn't exist; try appending _trial_weights.
+    # Path doesn't exist as given; try appending _trial_weights.
     candidate = p.with_name(p.stem + "_trial_weights.xlsx")
     if candidate.exists():
         print(f"  Note: INPUT_FILE resolved to trial_weights output: {candidate}")
+        _check_tai_sheet(candidate)
         return candidate
 
     raise FileNotFoundError(
         f"Could not find input file at '{p}' or '{candidate}'. "
         "Ensure trial_weight_calculator.py has been run first."
     )
+
+
+def _check_tai_sheet(path: Path) -> None:
+    """
+    Verify that the Excel file at *path* contains a sheet named "TA-I Summary".
+    Raises ValueError with a clear message if it does not.
+    """
+    import openpyxl
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    sheet_names = wb.sheetnames
+    wb.close()
+    if _TAI_SHEET not in sheet_names:
+        raise ValueError(
+            f"The file '{path}' does not contain a '{_TAI_SHEET}' sheet. "
+            f"Available sheets: {sheet_names}. "
+            "Ensure trial_weight_calculator.py has been run and produced this sheet."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1256,9 +1296,12 @@ def add_final_score(df: pd.DataFrame) -> pd.DataFrame:
 
 def run_calculations(input_path: Path) -> Path:
     """
-    Load the *_trial_weights.xlsx produced by trial_weight_calculator.py,
-    apply all derived-column calculations in order, and write the result to
-    <stem>_calculated.xlsx alongside the input file.
+    Load the "TA-I Summary" sheet from the *_trial_weights.xlsx produced by
+    trial_weight_calculator.py, apply all derived-column calculations in order,
+    and write the result to <stem>_calculated.xlsx alongside the input file.
+
+    The "TA-I Summary" sheet contains one row per unique TA-I — the single
+    highest-weighted trial for each therapy_area / ot_disease_name combination.
 
     Returns the output path.
     """
@@ -1266,8 +1309,8 @@ def run_calculations(input_path: Path) -> Path:
         print(f"ERROR: File not found: {input_path}")
         sys.exit(1)
 
-    print(f"\nLoading: {input_path}")
-    df = pd.read_excel(input_path)
+    print(f"\nLoading sheet '{_TAI_SHEET}' from: {input_path}")
+    df = pd.read_excel(input_path, sheet_name=_TAI_SHEET)
     print(f"  Loaded {len(df)} rows × {len(df.columns)} columns.")
 
     # Report which columns we inherited from trial_weight_calculator.py
@@ -1322,8 +1365,9 @@ if __name__ == "__main__":
     if not raw_path:
         print(
             "ERROR: No input file specified. "
-            "Set OUTPUT_FILE (or FILE) in your .env to the path of the "
-            "*_trial_weights.xlsx file produced by trial_weight_calculator.py."
+            f"Set OUTPUT_FILE (or FILE) in your .env to the path of the "
+            f"*_trial_weights.xlsx file produced by trial_weight_calculator.py. "
+            f"This script reads the '{_TAI_SHEET}' sheet from that file."
         )
         sys.exit(1)
 
