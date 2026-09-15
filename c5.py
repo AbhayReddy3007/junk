@@ -1269,20 +1269,49 @@ def process():
     # Rejoin non-CT rows (they skipped Steps 3-6)
     # -----------------------------------------------------------------------
     if "df_non_ct" in dir() and len(df_non_ct):
-        # Align columns before concat
-        for _col in df.columns:
-            if _col not in df_non_ct.columns:
-                df_non_ct[_col] = None
-        for _col in df_non_ct.columns:
-            if _col not in df.columns:
-                df[_col] = None
-        df = pd.concat([df, df_non_ct], ignore_index=True)
-        print(f"  Rejoined non-CT rows. Total rows: {len(df)}")
+        # Determine which TA-Is are already covered by CT rows in df.
+        # Non-CT rows for those TA-Is are redundant and must be dropped —
+        # they would otherwise compete in Steps 8/9 with nulled fields and
+        # risk being removed by the region-priority or max-size filters.
+        tai_with_ct_rows  = set(df["TA - I"].dropna().unique()) if "TA - I" in df.columns else set()
+        non_ct_tai_all    = set(df_non_ct["TA - I"].dropna().unique())
+        non_ct_tai_no_ct  = non_ct_tai_all - tai_with_ct_rows   # no CT rows → keep
+        non_ct_tai_has_ct = non_ct_tai_all & tai_with_ct_rows   # CT rows exist → drop
 
-        # Restore non-CT TA-Is to the tracker now that they are back in df.
-        # From this point on, Steps 7-9 can legitimately remove them.
-        rejoined_tai = set(df_non_ct["TA - I"].dropna().unique())
-        tracker._active |= rejoined_tai
+        if non_ct_tai_has_ct:
+            n_dropped = df_non_ct["TA - I"].isin(non_ct_tai_has_ct).sum()
+            print(f"  Dropping {n_dropped} non-CT row(s) from {len(non_ct_tai_has_ct)} "
+                  f"mixed TA-I(s) (CT rows already cover them): {sorted(non_ct_tai_has_ct)}")
+
+        df_non_ct = df_non_ct[df_non_ct["TA - I"].isin(non_ct_tai_no_ct)].copy()
+
+        if len(df_non_ct):
+            # Ensure all fetched fields are NA for pure non-CT rows so that
+            # Steps 8/9 do not filter them out on region priority or size.
+            _FETCHED_FIELDS = ["primary_region", "size", "drug_arm_size_n", "dosage",
+                               "secondary_countries"]
+            for _col in _FETCHED_FIELDS:
+                if _col in df_non_ct.columns:
+                    df_non_ct[_col] = None
+
+            # Align columns before concat
+            for _col in df.columns:
+                if _col not in df_non_ct.columns:
+                    df_non_ct[_col] = None
+            for _col in df_non_ct.columns:
+                if _col not in df.columns:
+                    df[_col] = None
+
+            df = pd.concat([df, df_non_ct], ignore_index=True)
+            print(f"  Rejoined {len(df_non_ct)} pure non-CT row(s) "
+                  f"({len(non_ct_tai_no_ct)} TA-I(s)) — all fetched fields=NA. "
+                  f"Total rows: {len(df)}")
+
+            # Restore only pure non-CT TA-Is to the tracker so Steps 7-9
+            # can legitimately record their removal if it happens.
+            tracker._active |= non_ct_tai_no_ct
+        else:
+            print("  No pure non-CT rows to rejoin (all non-CT TA-Is had CT rows).")
 
     # -----------------------------------------------------------------------
     # Step 5: BQ join
@@ -1351,18 +1380,39 @@ def process():
 
     # -----------------------------------------------------------------------
     # Step 8: Region-priority filter
+    # Non-CT rows (data_source != "Clinical Trials") are excluded from this
+    # filter entirely — they have no primary_region and should not be dropped
+    # just because a CT row for the same TA-I has a better region. In practice
+    # pure non-CT TA-Is have no CT competition, so the filter would leave them
+    # as Tier-3 "winners" anyway, but we exclude them explicitly for clarity.
     # -----------------------------------------------------------------------
     required_cols_8 = {"TA - I", "phase", "primary_region"}
     if required_cols_8.issubset(df.columns):
         before = len(df)
         pre_step8 = df.copy()
 
-        df["_region_priority"] = df["primary_region"].apply(region_priority)
-        df["_best_region_priority"] = df.groupby(
-            ["TA - I", "phase"], sort=False
-        )["_region_priority"].transform("min")
-        df = df[df["_region_priority"] == df["_best_region_priority"]].reset_index(drop=True)
-        df = df.drop(columns=["_region_priority", "_best_region_priority"])
+        # Identify CT rows (only these participate in region-priority filtering).
+        if "data_source" in df.columns:
+            _ds8 = df["data_source"].astype(str).str.strip().str.lower()
+            _is_ct8 = _ds8 == "clinical trials"
+        else:
+            _is_ct8 = pd.Series(True, index=df.index)
+
+        df_ct8     = df[_is_ct8].copy()
+        df_non_ct8 = df[~_is_ct8].copy()
+
+        # Apply region-priority filter to CT rows only.
+        if len(df_ct8):
+            df_ct8["_region_priority"] = df_ct8["primary_region"].apply(region_priority)
+            df_ct8["_best_region_priority"] = df_ct8.groupby(
+                ["TA - I", "phase"], sort=False
+            )["_region_priority"].transform("min")
+            df_ct8 = df_ct8[
+                df_ct8["_region_priority"] == df_ct8["_best_region_priority"]
+            ].drop(columns=["_region_priority", "_best_region_priority"])
+
+        # Recombine — non-CT rows pass through untouched.
+        df = pd.concat([df_ct8, df_non_ct8], ignore_index=True)
         print(f"\nStep 8 done: {before - len(df)} row(s) removed by region-priority filter. "
               f"Remaining rows: {len(df)}")
 
@@ -1373,25 +1423,33 @@ def process():
 
     # -----------------------------------------------------------------------
     # Step 9: Max-size filter
+    # CT rows are always preferred over non-CT rows for the same TA-I.
+    # A non-CT row is only kept if there are no CT rows for that TA-I.
+    # Within CT rows: tiebreaker is 1) highest size  2) highest phase  3) first.
     # -----------------------------------------------------------------------
     required_cols_9 = {"TA - I", "phase", "primary_region", "size"}
     if required_cols_9.issubset(df.columns):
         before = len(df)
         pre_step9 = df.copy()
 
-        # Goal: exactly one row per TA-I.
-        # Tiebreaker order: 1) highest size  2) highest phase  3) first row.
+        # Flag CT rows (1 = CT, 0 = non-CT) so CT always sorts above non-CT.
+        if "data_source" in df.columns:
+            _ds9 = df["data_source"].astype(str).str.strip().str.lower()
+            df["_is_ct"] = (_ds9 == "clinical trials").astype(int)
+        else:
+            df["_is_ct"] = 1
+
         df["_size_numeric"] = pd.to_numeric(df["size"], errors="coerce").fillna(0)
         df["_phase_rank"]   = df["phase"].apply(phase_rank)
 
-        # Sort so that for each TA-I the best row comes first, then keep it.
+        # Sort: CT rows first (_is_ct desc), then largest size, then highest phase.
         df = (
             df.sort_values(
-                ["TA - I", "_size_numeric", "_phase_rank"],
-                ascending=[True, False, False],
+                ["TA - I", "_is_ct", "_size_numeric", "_phase_rank"],
+                ascending=[True, False, False, False],
             )
             .drop_duplicates(subset=["TA - I"], keep="first")
-            .drop(columns=["_size_numeric", "_phase_rank"])
+            .drop(columns=["_is_ct", "_size_numeric", "_phase_rank"])
             .reset_index(drop=True)
         )
 
