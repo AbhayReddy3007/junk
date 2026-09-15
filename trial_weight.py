@@ -854,6 +854,8 @@ def write_output(df: pd.DataFrame, output_path: Path):
         ("dosage_score", "All other dosages", "0.50"),
         ("", "", ""),
         ("trial_weight (CT)", "= phase_weight × geo_score × sample_score × dosage_score", ""),
+        ("", "", ""),
+        ("OVERRIDE", "Approved / Submitted / Marketed trials → trial_weight = 1.0 (always)", "1.00"),
     ]
     hdr_fill, hdr_font = _hdr_style()
     for r, row in enumerate(legend_rows, start=1):
@@ -1005,6 +1007,21 @@ def process():
     df_ct["trial_weight"] = (
         df_ct["phase_weight"] * df_ct["geo_score"] * df_ct["sample_score"] * df_ct["dosage_score"]
     ).round(4)
+
+    # Approved trials always get trial_weight = 1.0, regardless of other scores
+    if "phase" in df_ct.columns:
+        approved_mask = df_ct["phase"].apply(
+            lambda p: not is_missing(p) and str(p).strip().lower() in
+                      ("approved", "submitted", "marketed")
+                      or (not is_missing(p) and any(
+                          kw in str(p).strip().lower()
+                          for kw in ("approved", "approv", "market", "submitted")
+                      ))
+        )
+        n_approved = approved_mask.sum()
+        df_ct.loc[approved_mask, "trial_weight"] = 1.0
+        if n_approved:
+            print(f"  Approved trial override: {n_approved} row(s) set to trial_weight = 1.0")
 
     # -----------------------------------------------------------------------
     # Weight calculation — non-CT rows: fixed 0.05, component scores = N/A
