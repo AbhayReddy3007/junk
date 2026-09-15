@@ -1154,6 +1154,19 @@ def process():
         print("Step 2 done: 'TA - I' column added.")
 
         # -----------------------------------------------------------------------
+        # Null phase for every non-Clinical-Trials row immediately.
+        # This is done at the row level (not TA-I level) so mixed TA-Is are
+        # handled correctly: CT rows keep their phase, non-CT rows get None.
+        # -----------------------------------------------------------------------
+        if "data_source" in df.columns and "phase" in df.columns:
+            ds_lower_all = df["data_source"].astype(str).str.strip().str.lower()
+            non_ct_row_mask = ds_lower_all != "clinical trials"
+            n_nulled = non_ct_row_mask.sum()
+            df.loc[non_ct_row_mask, "phase"] = None
+            if n_nulled:
+                print(f"  Phase set to None for {n_nulled} non-Clinical-Trials row(s).")
+
+        # -----------------------------------------------------------------------
         # Non-Clinical Trials split
         # -----------------------------------------------------------------------
         # TA-Is where data_source != "Clinical Trials" don't need fetching.
@@ -1161,7 +1174,7 @@ def process():
         # The TA-I names that are non-CT are stored in the cache so subsequent
         # runs don't re-evaluate them.
         _NON_CT_CACHE_KEY = "__non_clinical_trials_tai__"
-        _FETCH_COLS = ["size", "drug_arm_size_n", "dosage", "phase", "primary_region"]
+        _FETCH_COLS = ["size", "drug_arm_size_n", "dosage", "primary_region"]
         cache = _load_cache(cache_path) if cache_path else {}
         cached_non_ct_tai = set(cache.get(_NON_CT_CACHE_KEY, []))
 
@@ -1188,7 +1201,7 @@ def process():
         df_non_ct   = df[non_ct_mask].copy()
         df          = df[~non_ct_mask].copy()
 
-        # Null out the fetch-only fields for non-CT rows
+        # Null out the fetch-only fields for non-CT rows (phase already nulled above).
         for _col in _FETCH_COLS:
             if _col not in df_non_ct.columns:
                 df_non_ct[_col] = None
@@ -1197,7 +1210,12 @@ def process():
 
         if len(df_non_ct):
             print(f"  {len(df_non_ct['TA - I'].unique())} non-Clinical-Trials TA-I(s) "
-                  f"({len(df_non_ct)} row(s)) split out — fields set to NA, skipping Steps 3-6.")
+                  f"({len(df_non_ct)} row(s)) split out — phase=None, other fields=NA, skipping Steps 3-6.")
+
+        # Pause the tracker for non-CT TA-Is: they are temporarily absent from
+        # df during Steps 3-6 but will be rejoined later, so we must not count
+        # them as removed during snapshots taken in that window.
+        tracker._active -= non_ct_tai
 
         # -----------------------------------------------------------------------
         # Step 3: Deduplicate by highest phase (Clinical Trials rows only)
@@ -1260,6 +1278,11 @@ def process():
                 df[_col] = None
         df = pd.concat([df, df_non_ct], ignore_index=True)
         print(f"  Rejoined non-CT rows. Total rows: {len(df)}")
+
+        # Restore non-CT TA-Is to the tracker now that they are back in df.
+        # From this point on, Steps 7-9 can legitimately remove them.
+        rejoined_tai = set(df_non_ct["TA - I"].dropna().unique())
+        tracker._active |= rejoined_tai
 
     # -----------------------------------------------------------------------
     # Step 5: BQ join
