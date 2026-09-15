@@ -1,49 +1,39 @@
 """
 Trial Weight Calculator
 -----------------------
-Processes Clinical Trials data to compute a trial_weight score for each trial.
+Processes ALL rows from the input file and computes a trial_weight score.
 
-Steps performed:
+  • Clinical Trials rows: weight = phase_weight × geo_score × sample_score × dosage_score
+    (after enrichment via CT.gov + Gemini)
+  • Non-Clinical Trials rows: trial_weight = 0.05 (fixed, no enrichment attempted)
+
+Steps performed on Clinical Trials rows:
   1. Cleans trial_id (removes parenthetical suffixes).
   2. Adds 'TA - I' column (therapy_area + ot_disease_name).
-  3. Enrichment (Step 6): Fills missing primary_region, size, drug_arm_size_n, dosage
-     via ClinicalTrials.gov API and Gemini fallback.
-  4. Computes trial_weight = phase_weight * geo_score * sample_score * dosage_score
+  3. Enrichment: fills missing primary_region, size, drug_arm_size_n, dosage
+     via ClinicalTrials.gov API then Gemini fallback.
+  4. Computes weight components and trial_weight.
 
-Weight components
------------------
-phase_weight:
-  Phase 3 (or Approved) → 1.00
-  Phase 2               → 0.75
-  Phase 1               → 0.50
-  Phase NA / unknown    → 0.05
+Weight components (CT rows only)
+---------------------------------
+phase_weight : Phase 3/Approved→1.00 | Phase 2→0.75 | Phase 1→0.50 | NA→0.05
+geo_score    : US/UK/EU→1.00 | CA/CH/AU/JP→0.85 | Other→0.65
+sample_score : ≥500→1.00 | 300-499→0.85 | 50-299→0.65 | <50→0.40
+dosage_score : ranked within TA-I by phase then arm size → 1.00 / 0.75 / 0.50
 
-geo_score:
-  US / UK / EU (Tier 1) → 1.00
-  Canada / Switzerland / Australia / Japan (Tier 2) → 0.85
-  Any other             → 0.65
+Output sheets
+-------------
+  "Trial Weights"  — all rows with weight columns appended
+  "TA-I Summary"   — one row per TA-I: the trial with the highest trial_weight
+  "Legend"         — scoring rules
 
-sample_score  (based on drug_arm_size_n; falls back to size):
-  ≥ 500  → 1.00
-  300–499 → 0.85
-  50–199  → 0.65
-  < 50    → 0.40
-  (200–299 treated as 50–199 band, i.e. 0.65)
-
-dosage_score  (ranked within each TA-I by phase, then by drug_arm_size_n / size):
-  Highest priority dosage  → 1.00
-  Next                     → 0.75
-  All remaining            → 0.50
-
-.env variables required (same as the reference script):
-  OUTPUT_FILE                    - Path to the input Excel file
-  GOOGLE_APPLICATION_CREDENTIALS - Path to the GCP service account JSON
-  GEMINI_API_KEY                 - Gemini API key
-  FALLBACK_TRIALS_PER_CALL       - Trials per Gemini call (default: 5)
-
-BQ variables (PROJECT_ID, BQ_DATASET_ID, SSTABLE) are optional;
-if absent the BQ join is skipped and enrichment falls straight through
-to CT.gov + Gemini.
+.env variables
+--------------
+  OUTPUT_FILE                     Path to input Excel file  (required)
+  GEMINI_API_KEY                  Gemini API key            (required)
+  GOOGLE_APPLICATION_CREDENTIALS  GCP service-account JSON  (optional)
+  PROJECT_ID / BQ_DATASET_ID / SSTABLE  BigQuery vars       (optional)
+  FALLBACK_TRIALS_PER_CALL        Trials per Gemini call    (default: 5)
 """
 
 import json
@@ -60,12 +50,13 @@ from dotenv import load_dotenv
 import os
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 load_dotenv()
 
 
 # ---------------------------------------------------------------------------
-# Helpers (verbatim from reference script)
+# Helpers
 # ---------------------------------------------------------------------------
 
 def is_missing(val) -> bool:
@@ -118,24 +109,21 @@ def phase_rank(phase_value) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Weight computation
+# Weight components
 # ---------------------------------------------------------------------------
 
 def compute_phase_weight(phase_value) -> float:
     rank = phase_rank(phase_value)
-    if rank >= 3:   # Phase 3 or Approved/Phase 4
+    if rank >= 3:
         return 1.00
     if rank == 2:
         return 0.75
     if rank == 1:
         return 0.50
-    return 0.05     # unknown / NA
+    return 0.05
 
 
 def compute_geo_score(primary_region) -> float:
-    if is_missing(primary_region):
-        return 0.65
-
     _EU_COUNTRY_NAMES = {
         "austria", "belgium", "bulgaria", "croatia", "cyprus", "czech republic",
         "czechia", "denmark", "estonia", "finland", "france", "germany", "greece",
@@ -145,6 +133,8 @@ def compute_geo_score(primary_region) -> float:
     }
     _TIER2 = {"canada", "switzerland", "australia", "japan"}
 
+    if is_missing(primary_region):
+        return 0.65
     text = str(primary_region).strip().lower()
     if re.search(r"\b(us|usa|united states|u\.s\.a?\.?)\b", text):
         return 1.00
@@ -160,9 +150,6 @@ def compute_geo_score(primary_region) -> float:
 
 
 def compute_sample_score(drug_arm_size_n, size_fallback) -> float:
-    """
-    Use drug_arm_size_n preferentially; fall back to size if missing.
-    """
     n = None
     for candidate in (drug_arm_size_n, size_fallback):
         if not is_missing(candidate):
@@ -172,7 +159,7 @@ def compute_sample_score(drug_arm_size_n, size_fallback) -> float:
             except (ValueError, TypeError):
                 pass
     if n is None:
-        return 0.40   # treat as < 50 (worst band)
+        return 0.40
     if n >= 500:
         return 1.00
     if n >= 300:
@@ -184,44 +171,26 @@ def compute_sample_score(drug_arm_size_n, size_fallback) -> float:
 
 def assign_dosage_scores(df: pd.DataFrame) -> pd.Series:
     """
-    Assign dosage_score within each TA-I group.
-
-    Priority ordering of dosages:
-      1. Highest phase_rank
-      2. Within same phase: highest drug_arm_size_n (fallback: size)
-      3. Within same phase + arm size: original row order
-
-    Scores:
-      Rank 1  → 1.00
-      Rank 2  → 0.75
-      Rank 3+ → 0.50
+    Rank dosages within each TA-I group (CT rows only).
+    Priority: highest phase_rank → highest arm size (drug_arm_size_n or size).
+    Rank 1 → 1.00, Rank 2 → 0.75, Rank 3+ → 0.50.
     """
     scores = pd.Series(0.50, index=df.index, dtype=float)
-
-    df = df.copy()
-    df["_phase_rank_tmp"] = df["phase"].apply(phase_rank)
-    df["_arm_size_tmp"] = (
-        df["drug_arm_size_n"]
-        .combine_first(df["size"] if "size" in df.columns else pd.Series(dtype=float))
+    tmp = df.copy()
+    tmp["_phase_rank_tmp"] = tmp["phase"].apply(phase_rank)
+    size_col = tmp["drug_arm_size_n"] if "drug_arm_size_n" in tmp.columns else pd.Series(dtype=float)
+    fallback  = tmp["size"] if "size" in tmp.columns else pd.Series(dtype=float)
+    tmp["_arm_size_tmp"] = (
+        size_col.combine_first(fallback)
         .pipe(pd.to_numeric, errors="coerce")
         .fillna(0)
     )
-
-    for tai, group in df.groupby("TA - I", sort=False):
-        # Sort: highest phase first, then highest arm size (both descending).
+    for _tai, group in tmp.groupby("TA - I", sort=False):
         sorted_idx = group.sort_values(
-            ["_phase_rank_tmp", "_arm_size_tmp"],
-            ascending=[False, False],
+            ["_phase_rank_tmp", "_arm_size_tmp"], ascending=[False, False]
         ).index
-
         for rank_pos, idx in enumerate(sorted_idx):
-            if rank_pos == 0:
-                scores.at[idx] = 1.00
-            elif rank_pos == 1:
-                scores.at[idx] = 0.75
-            else:
-                scores.at[idx] = 0.50
-
+            scores.at[idx] = 1.00 if rank_pos == 0 else (0.75 if rank_pos == 1 else 0.50)
     return scores
 
 
@@ -251,7 +220,7 @@ def _save_cache(cache_path: Path, cache: dict):
 
 
 # ---------------------------------------------------------------------------
-# ClinicalTrials.gov API (Step 6a — verbatim from reference)
+# ClinicalTrials.gov API
 # ---------------------------------------------------------------------------
 
 _COUNTRY_TO_REGION = {
@@ -314,13 +283,12 @@ def _infer_region(countries):
 
 
 def _is_drug_arm(arm_type: str, arm_label: str) -> bool:
-    label_lower = arm_label.lower()
-    if any(kw in label_lower for kw in _CONTROL_ARM_KEYWORDS):
+    if any(kw in arm_label.lower() for kw in _CONTROL_ARM_KEYWORDS):
         return False
     return arm_type.upper() in ("EXPERIMENTAL", "ACTIVE_COMPARATOR")
 
 
-def _extract_drug_arm_size(study) -> int | None:
+def _extract_drug_arm_size(study) -> "int | None":
     protocol = study.get("protocolSection", {})
     arms = protocol.get("armsInterventionsModule", {}).get("armGroups", [])
 
@@ -335,19 +303,16 @@ def _extract_drug_arm_size(study) -> int | None:
                     drug_arm_total = (drug_arm_total or 0) + int(count)
                 except (ValueError, TypeError):
                     pass
-
     if drug_arm_total is not None:
         return drug_arm_total
 
     flow = study.get("resultsSection", {}).get("participantFlowModule", {})
     groups = flow.get("groups", [])
     periods = flow.get("periods", [])
-
     drug_group_ids = {
         g["id"] for g in groups
         if g.get("id") and not any(kw in g.get("title", "").lower() for kw in _CONTROL_ARM_KEYWORDS)
     }
-
     if drug_group_ids and periods:
         total = 0
         found = False
@@ -371,32 +336,26 @@ def _extract_drug_arm_size(study) -> int | None:
                 .get("enrollmentInfo", {})
                 .get("count")
     )
-
     n_arms = len(arms)
-    if n_arms <= 1:
-        if enroll_count is not None:
-            try:
-                return int(enroll_count)
-            except (ValueError, TypeError):
-                pass
-
+    if n_arms <= 1 and enroll_count is not None:
+        try:
+            return int(enroll_count)
+        except (ValueError, TypeError):
+            pass
     if enroll_count is not None:
         try:
             val = int(enroll_count)
             nct_id = protocol.get("identificationModule", {}).get("nctId", "?")
-            print(f"      [size fallback] {nct_id}: using total enrollment ({val}) — "
-                  f"per-arm counts unavailable")
+            print(f"      [size fallback] {nct_id}: using total enrollment ({val})")
             return val
         except (ValueError, TypeError):
             pass
-
     return None
 
 
 def _fetch_one_nct(nct_id, retries=4, delay=2.0):
     params = urllib.parse.urlencode({"filter.ids": nct_id, "pageSize": 1})
     url = f"https://clinicaltrials.gov/api/v2/studies?{params}"
-
     data = None
     for attempt in range(1, retries + 1):
         try:
@@ -410,7 +369,6 @@ def _fetch_one_nct(nct_id, retries=4, delay=2.0):
                 print(f"    CT.gov HTTP {e.code} for {nct_id}, retry in {wait:.0f}s ...")
                 time.sleep(wait)
                 if attempt == retries:
-                    print(f"    CT.gov: gave up on {nct_id}.")
                     return None
             else:
                 print(f"    CT.gov fetch error for {nct_id}: HTTP {e.code} {e.reason}")
@@ -423,7 +381,6 @@ def _fetch_one_nct(nct_id, retries=4, delay=2.0):
 
     if data is None:
         return None
-
     studies = data.get("studies", [])
     if not studies:
         print(f"    CT.gov: no study found for {nct_id}")
@@ -431,7 +388,6 @@ def _fetch_one_nct(nct_id, retries=4, delay=2.0):
 
     study = studies[0]
     protocol = study.get("protocolSection", {})
-
     returned_nct = protocol.get("identificationModule", {}).get("nctId", "")
     if returned_nct.upper() != nct_id.upper():
         print(f"    CT.gov ID mismatch for {nct_id} (got {returned_nct}), skipping.")
@@ -441,7 +397,6 @@ def _fetch_one_nct(nct_id, retries=4, delay=2.0):
     locations = protocol.get("contactsLocationsModule", {}).get("locations", [])
     countries = list({loc.get("country", "") for loc in locations if loc.get("country")})
     primary_region = _infer_region(countries)
-
     return {
         "primary_region": primary_region,
         "size": drug_arm_size,
@@ -454,7 +409,6 @@ def clinicaltrials_lookup(trial_ids, rate_limit_delay=0.5):
     results = {}
     if not nct_ids:
         return results
-
     print(f"  Querying ClinicalTrials.gov for {len(nct_ids)} NCT ID(s) ...")
     for i, nct_id in enumerate(nct_ids, 1):
         nct_id_clean = str(nct_id).strip().upper()
@@ -467,12 +421,11 @@ def clinicaltrials_lookup(trial_ids, rate_limit_delay=0.5):
             print("not found")
         if i < len(nct_ids):
             time.sleep(rate_limit_delay)
-
     return results
 
 
 # ---------------------------------------------------------------------------
-# Gemini fallback (Step 6b — verbatim from reference)
+# Gemini fallback
 # ---------------------------------------------------------------------------
 
 def _build_gemini_prompt(trial_ids):
@@ -483,24 +436,22 @@ Trial IDs:
 {trials_list}
 
 For each trial find:
-
-- primary_region: The primary geographic region of the trial sites.
-- size: Patients enrolled in the DRUG/TREATMENT arm(s) only (total enrollment if arm-level unavailable).
+- primary_region: Primary geographic region of trial sites.
+- size: Patients in DRUG/TREATMENT arm(s) only (total enrollment if arm-level unavailable).
 - drug_arm_size_n: Same as size.
-- dosage: Dose and regimen of the investigational drug arm (e.g. "10 mg once daily").
+- dosage: Dose/regimen of the investigational drug arm.
 
 Return ONLY a valid JSON array, no explanation, no markdown fences:
 [
   {{"trial_id": "NCT12345678", "primary_region": "United States", "size": 250, "drug_arm_size_n": 250, "dosage": "10 mg once daily"}}
 ]
-
-Use null only if genuinely not findable after searching. Do not guess.
+Use null only if genuinely not findable. Do not guess.
 """
 
 
 def _gemini_lookup_batch(trial_ids, api_key):
     models = ["gemini-2.5-flash", "gemini-3.1-flash-lite"]
-
+    raw = None
     for model_name in models:
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -525,20 +476,17 @@ def _gemini_lookup_batch(trial_ids, api_key):
             print(f"  WARNING: Gemini model {model_name} returned HTTP {e.code}")
             if model_name == models[-1]:
                 return []
-            continue
         except Exception as e:
             print(f"  WARNING: Gemini model {model_name} error: {e}")
             if model_name == models[-1]:
                 return []
-            continue
-    else:
+    if raw is None:
         return []
-
     try:
         parts = raw["candidates"][0]["content"]["parts"]
         text_parts = [p["text"] for p in parts if "text" in p and not p.get("thought", False)]
         if not text_parts:
-            raise ValueError("No text part in Gemini response")
+            raise ValueError("No text part")
         text = " ".join(text_parts)
     except (KeyError, IndexError, ValueError) as e:
         print(f"  WARNING: Unexpected Gemini response structure: {e}")
@@ -549,10 +497,8 @@ def _gemini_lookup_batch(trial_ids, api_key):
     if not match:
         print(f"  WARNING: No JSON array in Gemini response. Raw: {text[:500]}")
         return []
-    text = match.group(0)
-
     try:
-        results = json.loads(text)
+        results = json.loads(match.group(0))
         return results if isinstance(results, list) else []
     except json.JSONDecodeError as e:
         print(f"  WARNING: Could not parse Gemini JSON: {e}")
@@ -581,14 +527,13 @@ def gemini_fallback(trial_ids, api_key, batch_size):
 
 
 # ---------------------------------------------------------------------------
-# Enrichment: fill missing fields via CT.gov → Gemini
+# Enrichment (CT-only rows)
 # ---------------------------------------------------------------------------
 
 def fill_missing_fields(df: pd.DataFrame, api_key: str, batch_size: int,
                         cache_path: Path = None) -> pd.DataFrame:
     target_cols = ["primary_region", "size", "drug_arm_size_n", "dosage"]
     df = df.reset_index(drop=True)
-
     for col in target_cols:
         if col not in df.columns:
             df[col] = None
@@ -602,11 +547,10 @@ def fill_missing_fields(df: pd.DataFrame, api_key: str, batch_size: int,
     def _needs_fill(row):
         return any(is_missing(row.get(col)) for col in target_cols)
 
-    print(f"\nEnrichment — Missing field summary (before fallback):")
+    print(f"\nEnrichment — before fallback:")
     for col in target_cols:
         print(f"  Missing {col:25s}: {df[col].apply(is_missing).sum()} row(s)")
 
-    # Determine which unique trial IDs need enrichment
     missing_per_trial = {}
     for _, row in df.iterrows():
         if not _needs_fill(row):
@@ -620,10 +564,10 @@ def fill_missing_fields(df: pd.DataFrame, api_key: str, batch_size: int,
 
     unique_trials_needing_fill = list(missing_per_trial.keys())
     if not unique_trials_needing_fill:
-        print("Enrichment: No rows with missing fields. Skipping API calls.")
+        print("Enrichment: Nothing missing. Skipping API calls.")
         return df.drop(columns=["_trial_id_upper"])
 
-    # Apply cache
+    # Cache
     cache_filled = 0
     still_needing_fill = []
     for tid in unique_trials_needing_fill:
@@ -637,13 +581,12 @@ def fill_missing_fields(df: pd.DataFrame, api_key: str, batch_size: int,
                         cache_filled += 1
         else:
             still_needing_fill.append(tid)
-
     if cache_filled:
         print(f"  Cache filled {cache_filled} cell(s).")
     unique_trials_needing_fill = still_needing_fill
 
     if not unique_trials_needing_fill:
-        print("Enrichment: All missing fields resolved from cache.")
+        print("Enrichment: All resolved from cache.")
         return df.drop(columns=["_trial_id_upper"])
 
     # CT.gov
@@ -668,9 +611,11 @@ def fill_missing_fields(df: pd.DataFrame, api_key: str, batch_size: int,
     # Gemini
     still_missing_trials = [
         tid for tid in unique_trials_needing_fill
-        if any(is_missing(df.loc[df["_trial_id_upper"] == tid, col].values[0])
-               for col in target_cols
-               if len(df.loc[df["_trial_id_upper"] == tid]) > 0)
+        if any(
+            is_missing(df.loc[df["_trial_id_upper"] == tid, col].values[0])
+            for col in target_cols
+            if len(df.loc[df["_trial_id_upper"] == tid]) > 0
+        )
     ]
     if still_missing_trials:
         print(f"  {len(still_missing_trials)} trial(s) still missing → Gemini ...")
@@ -692,11 +637,11 @@ def fill_missing_fields(df: pd.DataFrame, api_key: str, batch_size: int,
             cache[tid]["_gemini_found"] = True
         _save_cache(cache_path, cache)
     else:
-        print("  All fields resolved by CT.gov. Gemini not needed.")
+        print("  All resolved by CT.gov. Gemini not needed.")
 
     df = df.drop(columns=["_trial_id_upper"])
 
-    print(f"\nEnrichment — Missing field summary (after fallback):")
+    print(f"\nEnrichment — after fallback:")
     for col in target_cols:
         print(f"  Still missing {col:20s}: {df[col].apply(is_missing).sum()} row(s)")
 
@@ -713,7 +658,6 @@ def try_bq_join(df: pd.DataFrame, project_id: str, dataset_id: str, bq_table: st
     except ImportError:
         print("  google-cloud-bigquery not installed — skipping BQ join.")
         return df
-
     try:
         client = bigquery.Client(project=project_id)
         query = f"""
@@ -723,7 +667,6 @@ def try_bq_join(df: pd.DataFrame, project_id: str, dataset_id: str, bq_table: st
         print(f"BQ join: querying `{project_id}.{dataset_id}.{bq_table}` ...")
         bq_df = client.query(query).to_dataframe()
         print(f"  Fetched {len(bq_df)} rows from BigQuery.")
-
         bq_cols = ["trial_id", "primary_region", "secondary_countries",
                    "size", "drug_arm_size_n", "dosage"]
         bq_df = bq_df[[c for c in bq_cols if c in bq_df.columns]].copy()
@@ -734,7 +677,6 @@ def try_bq_join(df: pd.DataFrame, project_id: str, dataset_id: str, bq_table: st
                  .drop_duplicates(subset=["trial_id"], keep="first")
                  .drop(columns=["_non_null_count"])
         )
-
         existing = [c for c in bq_cols if c != "trial_id" and c in df.columns]
         if existing:
             df = df.drop(columns=existing)
@@ -742,75 +684,139 @@ def try_bq_join(df: pd.DataFrame, project_id: str, dataset_id: str, bq_table: st
         print(f"  BQ join done. Rows: {len(df)}")
     except Exception as e:
         print(f"  WARNING: BQ join failed: {e}")
-
     return df
 
 
 # ---------------------------------------------------------------------------
-# Excel output with formatting
+# Excel output
 # ---------------------------------------------------------------------------
 
-def write_output(df: pd.DataFrame, output_path: Path):
-    """Write the result to an Excel file with colour-coded trial_weight column."""
+_FN = "Arial"
 
-    df.to_excel(output_path, index=False, sheet_name="Trial Weights")
+def _hdr_style():
+    return (
+        PatternFill("solid", fgColor="1F4E79"),
+        Font(name=_FN, bold=True, color="FFFFFF", size=11),
+    )
 
-    wb = openpyxl.load_workbook(output_path)
-    ws = wb.active
-    ws.title = "Trial Weights"
+def _thin_border():
+    s = Side(style="thin", color="BFBFBF")
+    return Border(left=s, right=s, top=s, bottom=s)
 
-    FN = "Arial"
-    hdr_fill = PatternFill("solid", fgColor="1F4E79")
-    hdr_font = Font(name=FN, bold=True, color="FFFFFF", size=11)
-    center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    left_align   = Alignment(horizontal="left",   vertical="center")
+def _tw_fill(val):
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return None
+    if v >= 0.75:
+        return PatternFill("solid", fgColor="C6EFCE")
+    if v >= 0.50:
+        return PatternFill("solid", fgColor="FFEB9C")
+    return PatternFill("solid", fgColor="FFC7CE")
 
-    thin = Side(style="thin", color="BFBFBF")
-    thin_border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    # Header row
-    for cell in ws[1]:
+def _format_sheet(ws, headers, tw_col_idx, freeze_row=2):
+    """Apply standard header + alternating-row formatting to a worksheet."""
+    hdr_fill, hdr_font = _hdr_style()
+    border = _thin_border()
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left   = Alignment(horizontal="left",   vertical="center")
+    alt_fill = PatternFill("solid", fgColor="F2F2F2")
+
+    for col_num, cell in enumerate(ws[1], start=1):
         cell.font      = hdr_font
         cell.fill      = hdr_fill
-        cell.alignment = center_align
-        cell.border    = thin_border
+        cell.alignment = center
+        cell.border    = border
     ws.row_dimensions[1].height = 22
-
-    # Find trial_weight column
-    headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
-    tw_col = headers.index("trial_weight") + 1 if "trial_weight" in headers else None
-
-    # Colour bands for trial_weight
-    def _tw_fill(val):
-        try:
-            v = float(val)
-        except (TypeError, ValueError):
-            return None
-        if v >= 0.75:
-            return PatternFill("solid", fgColor="C6EFCE")   # green
-        if v >= 0.50:
-            return PatternFill("solid", fgColor="FFEB9C")   # amber
-        return PatternFill("solid", fgColor="FFC7CE")        # red
-
-    alt_fill = PatternFill("solid", fgColor="F2F2F2")
 
     for row_num in range(2, ws.max_row + 1):
         is_alt = (row_num % 2 == 0)
         for col_num in range(1, ws.max_column + 1):
             cell = ws.cell(row=row_num, column=col_num)
-            cell.font   = Font(name=FN, size=10)
-            cell.border = thin_border
-            cell.alignment = center_align if col_num == tw_col else left_align
-            if col_num == tw_col:
-                tw_fill = _tw_fill(cell.value)
-                if tw_fill:
-                    cell.fill = tw_fill
-                    cell.font = Font(name=FN, size=10, bold=True)
+            cell.font   = Font(name=_FN, size=10)
+            cell.border = border
+            cell.alignment = center if col_num == tw_col_idx else left
+            if col_num == tw_col_idx:
+                f = _tw_fill(cell.value)
+                if f:
+                    cell.fill = f
+                    cell.font = Font(name=_FN, size=10, bold=True)
             elif is_alt:
                 cell.fill = alt_fill
         ws.row_dimensions[row_num].height = 16
 
-    # Column widths
+    ws.freeze_panes = f"A{freeze_row}"
+
+
+def _set_col_widths(ws, headers, widths_map, default=18):
+    for col_num, header in enumerate(headers, start=1):
+        w = widths_map.get(str(header), default)
+        ws.column_dimensions[get_column_letter(col_num)].width = w
+
+
+def add_tai_summary_sheet(wb, df_all: pd.DataFrame):
+    """
+    Add 'TA-I Summary' sheet: one row per TA-I — the trial with the highest
+    trial_weight. Ties broken by highest phase_rank then first occurrence.
+    """
+    if "TA - I" not in df_all.columns or "trial_weight" in df_all.columns is False:
+        print("  WARNING: Cannot build TA-I Summary — 'TA - I' or 'trial_weight' missing.")
+        return
+
+    # Compute phase_rank for tiebreaking
+    tmp = df_all.copy()
+    tmp["_pr"] = tmp["phase"].apply(phase_rank) if "phase" in tmp.columns else 0
+
+    # Sort: highest trial_weight → highest phase_rank → first row
+    tmp = tmp.sort_values(
+        ["TA - I", "trial_weight", "_pr"],
+        ascending=[True, False, False],
+    )
+    summary = tmp.drop_duplicates(subset=["TA - I"], keep="first").drop(columns=["_pr"])
+    summary = summary.reset_index(drop=True)
+
+    # Write sheet
+    if "TA-I Summary" in wb.sheetnames:
+        del wb["TA-I Summary"]
+    ws = wb.create_sheet("TA-I Summary", 1)   # insert as second sheet
+
+    headers = list(summary.columns)
+    for col_num, h in enumerate(headers, start=1):
+        ws.cell(row=1, column=col_num, value=h)
+    for row_num, (_, row) in enumerate(summary.iterrows(), start=2):
+        for col_num, h in enumerate(headers, start=1):
+            val = row[h]
+            ws.cell(row=row_num, column=col_num, value=(None if is_missing(val) else val))
+
+    tw_col_idx = (headers.index("trial_weight") + 1) if "trial_weight" in headers else None
+    _format_sheet(ws, headers, tw_col_idx)
+
+    col_widths = {
+        "trial_id": 18, "TA - I": 48, "therapy_area": 22, "ot_disease_name": 30,
+        "phase": 12, "primary_region": 22, "drug_arm_size_n": 18, "size": 10,
+        "dosage": 35, "data_source": 18,
+        "phase_weight": 14, "geo_score": 12, "sample_score": 14,
+        "dosage_score": 14, "trial_weight": 14,
+    }
+    _set_col_widths(ws, headers, col_widths)
+
+    print(f"  'TA-I Summary' sheet: {len(summary)} unique TA-I(s).")
+
+
+def write_output(df: pd.DataFrame, output_path: Path):
+    """Write Trial Weights sheet, TA-I Summary sheet, and Legend sheet."""
+
+    # ---- Trial Weights sheet ----
+    df.to_excel(output_path, index=False, sheet_name="Trial Weights")
+    wb = openpyxl.load_workbook(output_path)
+    ws = wb.active
+    ws.title = "Trial Weights"
+
+    headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+    tw_col_idx = (headers.index("trial_weight") + 1) if "trial_weight" in headers else None
+    _format_sheet(ws, headers, tw_col_idx)
+
     col_widths = {
         "trial_id": 18, "TA - I": 45, "therapy_area": 22, "ot_disease_name": 30,
         "phase": 12, "primary_region": 22, "drug_arm_size_n": 18, "size": 10,
@@ -818,16 +824,17 @@ def write_output(df: pd.DataFrame, output_path: Path):
         "phase_weight": 14, "geo_score": 12, "sample_score": 14,
         "dosage_score": 14, "trial_weight": 14,
     }
-    for col_num, header in enumerate(headers, start=1):
-        width = col_widths.get(str(header), 18)
-        ws.column_dimensions[openpyxl.utils.get_column_letter(col_num)].width = width
+    _set_col_widths(ws, headers, col_widths)
 
-    ws.freeze_panes = "A2"
+    # ---- TA-I Summary sheet ----
+    add_tai_summary_sheet(wb, df)
 
-    # Legend sheet
+    # ---- Legend sheet ----
     ls = wb.create_sheet("Legend")
     legend_rows = [
         ("Component", "Condition", "Score"),
+        ("trial_weight (non-CT)", "data_source ≠ Clinical Trials", "0.05 (fixed)"),
+        ("", "", ""),
         ("phase_weight", "Phase 3 / Approved", "1.00"),
         ("phase_weight", "Phase 2", "0.75"),
         ("phase_weight", "Phase 1", "0.50"),
@@ -846,17 +853,18 @@ def write_output(df: pd.DataFrame, output_path: Path):
         ("dosage_score", "Second-priority dosage", "0.75"),
         ("dosage_score", "All other dosages", "0.50"),
         ("", "", ""),
-        ("trial_weight", "= phase_weight × geo_score × sample_score × dosage_score", ""),
+        ("trial_weight (CT)", "= phase_weight × geo_score × sample_score × dosage_score", ""),
     ]
+    hdr_fill, hdr_font = _hdr_style()
     for r, row in enumerate(legend_rows, start=1):
         for c, val in enumerate(row, start=1):
             cell = ls.cell(row=r, column=c, value=val)
-            cell.font = Font(name=FN, bold=(r == 1), size=10)
+            cell.font = Font(name=_FN, bold=(r == 1), size=10)
             cell.alignment = Alignment(horizontal="left", vertical="center")
             if r == 1:
-                cell.fill = PatternFill("solid", fgColor="1F4E79")
-                cell.font = Font(name=FN, bold=True, color="FFFFFF", size=11)
-    for col_letter, width in zip(["A", "B", "C"], [16, 55, 10]):
+                cell.fill = hdr_fill
+                cell.font = hdr_font
+    for col_letter, width in zip(["A", "B", "C"], [22, 55, 10]):
         ls.column_dimensions[col_letter].width = width
 
     wb.save(output_path)
@@ -872,14 +880,12 @@ def process():
     credentials    = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     gemini_api_key = os.getenv("GEMINI_API_KEY")
     fallback_batch = os.getenv("FALLBACK_TRIALS_PER_CALL", "5")
-
-    # BQ vars are optional
-    project_id  = os.getenv("PROJECT_ID")
-    dataset_id  = os.getenv("BQ_DATASET_ID")
-    bq_table    = os.getenv("SSTABLE")
+    project_id     = os.getenv("PROJECT_ID")
+    dataset_id     = os.getenv("BQ_DATASET_ID")
+    bq_table       = os.getenv("SSTABLE")
 
     missing_required = [k for k, v in {
-        "OUTPUT_FILE":   input_file,
+        "OUTPUT_FILE":    input_file,
         "GEMINI_API_KEY": gemini_api_key,
     }.items() if not v]
     if missing_required:
@@ -910,132 +916,152 @@ def process():
     print(f"Cache file  : {cache_path}")
 
     # -----------------------------------------------------------------------
-    # Load
+    # Load all rows
     # -----------------------------------------------------------------------
-    df = pd.read_excel(input_path)
-    print(f"\nLoaded {len(df)} rows, {len(df.columns)} columns.")
+    df_all = pd.read_excel(input_path)
+    print(f"\nLoaded {len(df_all)} rows, {len(df_all.columns)} columns.")
 
     # -----------------------------------------------------------------------
-    # Filter: Clinical Trials only
+    # Split CT vs non-CT
     # -----------------------------------------------------------------------
-    if "data_source" in df.columns:
-        before = len(df)
-        df = df[df["data_source"].astype(str).str.strip().str.lower() == "clinical trials"].copy()
-        print(f"\nFiltered to Clinical Trials rows: {len(df)} / {before} rows retained.")
+    if "data_source" in df_all.columns:
+        is_ct = df_all["data_source"].astype(str).str.strip().str.lower() == "clinical trials"
     else:
-        print("\nWARNING: 'data_source' column not found — processing all rows as Clinical Trials.")
+        print("WARNING: 'data_source' column not found — treating all rows as Clinical Trials.")
+        is_ct = pd.Series(True, index=df_all.index)
 
-    if df.empty:
-        print("No Clinical Trials rows found. Nothing to process.")
-        sys.exit(0)
-
-    df = df.reset_index(drop=True)
+    df_ct     = df_all[is_ct].copy().reset_index(drop=True)
+    df_non_ct = df_all[~is_ct].copy().reset_index(drop=True)
+    print(f"  Clinical Trials rows : {len(df_ct)}")
+    print(f"  Non-CT rows          : {len(df_non_ct)}")
 
     # -----------------------------------------------------------------------
-    # Step 1: Clean trial_id
+    # Step 1: Clean trial_id  (CT rows)
     # -----------------------------------------------------------------------
-    if "trial_id" not in df.columns:
-        print("WARNING: 'trial_id' column not found. Skipping Step 1.")
-    else:
-        df["trial_id"] = (
-            df["trial_id"].astype(str)
+    if "trial_id" in df_ct.columns:
+        df_ct["trial_id"] = (
+            df_ct["trial_id"].astype(str)
             .str.replace(r"\s*\(.*?\)\s*$", "", regex=True)
             .str.strip()
         )
-        print("Step 1 done: trial_id cleaned.")
+        print("\nStep 1 done: trial_id cleaned (CT rows).")
 
     # -----------------------------------------------------------------------
-    # Step 2: Add TA - I
+    # Step 2: Add TA - I  (both splits)
     # -----------------------------------------------------------------------
-    missing_ta_cols = [c for c in ("therapy_area", "ot_disease_name") if c not in df.columns]
+    missing_ta_cols = [c for c in ("therapy_area", "ot_disease_name") if c not in df_all.columns]
     if missing_ta_cols:
         print(f"WARNING: Columns {missing_ta_cols} not found. 'TA - I' will not be created.")
     else:
-        df["TA - I"] = (
-            df["therapy_area"].astype(str) + " - " + df["ot_disease_name"].astype(str)
-        )
+        for _df in (df_ct, df_non_ct):
+            _df["TA - I"] = (
+                _df["therapy_area"].astype(str) + " - " + _df["ot_disease_name"].astype(str)
+            )
         print("Step 2 done: 'TA - I' column added.")
 
-    # Normalise phase
-    if "phase" in df.columns:
-        df["phase"] = df["phase"].apply(normalize_phase)
-        print("Phase values normalised.")
+    # Normalise phase for CT rows
+    if "phase" in df_ct.columns:
+        df_ct["phase"] = df_ct["phase"].apply(normalize_phase)
+        print("Phase values normalised (CT rows).")
 
     # -----------------------------------------------------------------------
-    # Optional BQ join (Step 5 equivalent)
+    # Optional BQ join  (CT rows only)
     # -----------------------------------------------------------------------
-    if all([project_id, dataset_id, bq_table]) and "trial_id" in df.columns:
-        print("\nBQ credentials found — attempting join ...")
-        df = try_bq_join(df, project_id, dataset_id, bq_table)
+    if all([project_id, dataset_id, bq_table]) and "trial_id" in df_ct.columns:
+        print("\nBQ credentials found — attempting join (CT rows) ...")
+        df_ct = try_bq_join(df_ct, project_id, dataset_id, bq_table)
     else:
         print("\nBQ variables not fully set — skipping BQ join.")
 
     # -----------------------------------------------------------------------
-    # Step 6: Enrichment (CT.gov + Gemini)
+    # Step 6: Enrichment  (CT rows only)
     # -----------------------------------------------------------------------
-    if "trial_id" in df.columns:
-        print("\nStep 6: Enrichment ...")
-        df = fill_missing_fields(df, gemini_api_key, batch_size, cache_path=cache_path)
+    if "trial_id" in df_ct.columns and not df_ct.empty:
+        print("\nStep 6: Enrichment (CT rows) ...")
+        df_ct = fill_missing_fields(df_ct, gemini_api_key, batch_size, cache_path=cache_path)
     else:
-        print("\nStep 6 skipped: no trial_id column.")
+        print("\nStep 6 skipped.")
 
     # Ensure numeric types for size columns
     for col in ["size", "drug_arm_size_n"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        if col in df_ct.columns:
+            df_ct[col] = pd.to_numeric(df_ct[col], errors="coerce")
 
     # -----------------------------------------------------------------------
-    # Weight calculation
+    # Weight calculation — CT rows
     # -----------------------------------------------------------------------
-    print("\nCalculating weight components ...")
+    print("\nCalculating weights (CT rows) ...")
 
-    # phase_weight
-    df["phase_weight"] = df["phase"].apply(compute_phase_weight)
-
-    # geo_score
-    df["geo_score"] = df["primary_region"].apply(compute_geo_score)
-
-    # sample_score
-    df["sample_score"] = df.apply(
-        lambda r: compute_sample_score(
-            r.get("drug_arm_size_n"), r.get("size")
-        ), axis=1
+    df_ct["phase_weight"] = df_ct["phase"].apply(compute_phase_weight) if "phase" in df_ct.columns else 0.05
+    df_ct["geo_score"]    = df_ct["primary_region"].apply(compute_geo_score) if "primary_region" in df_ct.columns else 0.65
+    df_ct["sample_score"] = df_ct.apply(
+        lambda r: compute_sample_score(r.get("drug_arm_size_n"), r.get("size")), axis=1
     )
-
-    # dosage_score (within TA-I, ordered by phase then arm size)
-    if "TA - I" in df.columns:
-        df["dosage_score"] = assign_dosage_scores(df)
+    if "TA - I" in df_ct.columns:
+        df_ct["dosage_score"] = assign_dosage_scores(df_ct)
     else:
-        # No grouping possible — every row gets top score
-        df["dosage_score"] = 1.00
+        df_ct["dosage_score"] = 1.00
 
-    # trial_weight
-    df["trial_weight"] = (
-        df["phase_weight"] * df["geo_score"] * df["sample_score"] * df["dosage_score"]
+    df_ct["trial_weight"] = (
+        df_ct["phase_weight"] * df_ct["geo_score"] * df_ct["sample_score"] * df_ct["dosage_score"]
     ).round(4)
 
-    print("Weight calculation done.")
+    # -----------------------------------------------------------------------
+    # Weight calculation — non-CT rows: fixed 0.05, component scores = N/A
+    # -----------------------------------------------------------------------
+    print("Setting trial_weight = 0.05 for non-CT rows ...")
+    weight_cols = ["phase_weight", "geo_score", "sample_score", "dosage_score"]
+    for col in weight_cols:
+        df_non_ct[col] = None          # N/A — no meaningful breakdown
+    df_non_ct["trial_weight"] = 0.05
+
+    # -----------------------------------------------------------------------
+    # Recombine
+    # -----------------------------------------------------------------------
+    # Align columns
+    all_cols = list(dict.fromkeys(list(df_ct.columns) + list(df_non_ct.columns)))
+    for col in all_cols:
+        if col not in df_ct.columns:
+            df_ct[col] = None
+        if col not in df_non_ct.columns:
+            df_non_ct[col] = None
+
+    df_final = pd.concat([df_ct, df_non_ct], ignore_index=True)
+
+    # Put weight cols at the end
+    weight_cols_all = ["phase_weight", "geo_score", "sample_score", "dosage_score", "trial_weight"]
+    other_cols = [c for c in df_final.columns if c not in weight_cols_all]
+    df_final = df_final[other_cols + weight_cols_all]
+
+    # Sort: TA-I alphabetically, then CT rows first, then descending trial_weight
+    sort_keys = []
+    if "TA - I" in df_final.columns:
+        sort_keys.append("TA - I")
+    if "data_source" in df_final.columns:
+        df_final["_is_ct_sort"] = (~is_ct.reindex(df_final.index, fill_value=False)).astype(int)
+        sort_keys.append("_is_ct_sort")
+    sort_keys.append("trial_weight")
+    df_final = df_final.sort_values(sort_keys, ascending=[True] * (len(sort_keys) - 1) + [False])
+    if "_is_ct_sort" in df_final.columns:
+        df_final = df_final.drop(columns=["_is_ct_sort"])
+    df_final = df_final.reset_index(drop=True)
+
+    # Clean pd.NA
+    for col in df_final.columns:
+        df_final[col] = df_final[col].where(df_final[col].notna(), other=None)
+
+    print(f"\nFinal dataset: {len(df_final)} rows ({len(df_ct)} CT + {len(df_non_ct)} non-CT).")
     print(f"\nSummary statistics for trial_weight:")
-    desc = df["trial_weight"].describe()
+    desc = df_final["trial_weight"].describe()
     for stat in ["count", "mean", "min", "25%", "50%", "75%", "max"]:
         print(f"  {stat:6s}: {desc[stat]:.4f}")
 
     # -----------------------------------------------------------------------
-    # Reorder columns: put weight cols at the end
-    # -----------------------------------------------------------------------
-    weight_cols = ["phase_weight", "geo_score", "sample_score", "dosage_score", "trial_weight"]
-    other_cols  = [c for c in df.columns if c not in weight_cols]
-    df = df[other_cols + weight_cols]
-
-    # Clean pd.NA before saving
-    for col in df.columns:
-        df[col] = df[col].where(df[col].notna(), other=None)
-
-    # -----------------------------------------------------------------------
     # Write output
     # -----------------------------------------------------------------------
-    write_output(df, output_path)
+    write_output(df_final, output_path)
     print(f"\nDone. Output: {output_path}")
+    print(f"  Sheets: 'Trial Weights', 'TA-I Summary', 'Legend'")
 
 
 if __name__ == "__main__":
